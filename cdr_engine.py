@@ -290,7 +290,13 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
         if missing:
             raise ValueError(f"not a Grandstream CDR export - missing column(s): {', '.join(missing)}")
         frames.append(t)
-    t = pd.concat(frames, ignore_index=True).drop_duplicates()
+    return grandstream_from_table(pd.concat(frames, ignore_index=True))
+
+
+def grandstream_from_table(t: pd.DataFrame) -> pd.DataFrame:
+    """Same as load_grandstream, but from a table already in the UCM export's column layout
+    (used by the live UCM API connection)."""
+    t = t.astype(str).drop_duplicates()
     for c in ("Answer Time", "End Time", "Talk Time", "Call Time", "Action Type", "Last app.", "Caller Name",
               "Caller ID", "Unique ID", "Dest Channel Extension", "Context"):
         if c not in t:

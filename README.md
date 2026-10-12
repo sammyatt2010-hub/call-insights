@@ -107,6 +107,8 @@ streamlit run app.py
 | `app.py` | Streamlit interface |
 | `cdr_engine.py` | Parsing, call stitching, missed-call tracking, metrics, insights |
 | `users.py` | Per-person (user) assessment metrics and observations |
+| `ui.py` | Shared look and results dashboard (also used by customer portals) |
+| `ucm_client.py` | Grandstream UCM API client (used by customer portals) |
 | `report_pdf.py` | 2-page A4 PDF report - "Portal" (dark, matches the web app) or "Print-friendly" (light) |
 | `fonts/` | Inter font files used by the PDF (SIL Open Font Licence - see `fonts/LICENSE-Inter.txt`) |
 | `.streamlit/config.toml` | Dark theme |
