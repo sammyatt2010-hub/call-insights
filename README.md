@@ -18,6 +18,24 @@ Upload a raw PBX call-record (CDR) export and get a true picture of call handlin
 - **Periods:** whole file (auto-detected), this month, last month, last 30 / 7 days, or custom.
   Call-backs are still searched across the whole file, so a call missed on the 31st and returned on the 1st counts.
 
+## User assessment
+
+A **User assessment** tab and a separate multi-page **User assessment PDF** (team overview, ring groups, then a
+card per person with stats, observations and a calls-by-hour chart).
+
+| Measure | Grandstream | Bicom | TruSIP |
+|---|---|---|---|
+| Inbound calls that rang each person, pick-up rate, calls lost while ringing | Yes | - | - |
+| Inbound answered, share of team, time to answer, talk time | Yes | Yes | - |
+| Outbound calls, connect rate, numbers dialled | Yes | Yes (per extension) | - |
+| Internal calls, transfers, typical working hours | Yes | - | - |
+| Missed calls each person returned | Yes | Yes | - |
+| Ring-group performance (members, answer %, who carries the load) | Yes | - | - |
+
+Observations are generated per person, e.g. a handset that rings on hundreds of calls but never answers
+(check ring-group membership / Do Not Disturb), people carrying a large share of calls, slow or fast answering,
+low outbound connect rates, frequent transfers, missed calls returned and typical hours.
+
 ## Settings (sidebar)
 
 Opening hours and days, answer-rate target, call-back target, "ignore hang-ups under X seconds",
@@ -88,6 +106,7 @@ streamlit run app.py
 |---|---|
 | `app.py` | Streamlit interface |
 | `cdr_engine.py` | Parsing, call stitching, missed-call tracking, metrics, insights |
+| `users.py` | Per-person (user) assessment metrics and observations |
 | `report_pdf.py` | 2-page A4 PDF report - "Portal" (dark, matches the web app) or "Print-friendly" (light) |
 | `fonts/` | Inter font files used by the PDF (SIL Open Font Licence - see `fonts/LICENSE-Inter.txt`) |
 | `.streamlit/config.toml` | Dark theme |

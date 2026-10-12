@@ -318,6 +318,9 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
     rows: list[dict] = []
     did_groups: dict[str, list[str]] = {}
     transfers = 0
+    # per-user detail for the user assessment
+    ring_events: list[dict] = []
+    transfer_events: list[dict] = []
     for _, m in mains.iterrows():
         ctype = m["Call Type"].lower()
         session = m["Session"]
@@ -336,6 +339,9 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
         # A colleague transferring an answered call creates a new session keyed on their extension
         if session.rsplit("-", 1)[-1] != caller and re.fullmatch(r"\d{2,5}", session.rsplit("-", 1)[-1] or ""):
             transfers += 1
+            transfer_events.append({"ts": m["ts"], "from_ext": session.rsplit("-", 1)[-1],
+                                    "to_ext": m["Callee Number"], "talk_s": int(m["talk_n"]),
+                                    "answered": m["Call Status"].upper() == "ANSWERED" and m["talk_n"] > 0})
             continue
         legs = sub_by_session.get(session)
         if legs is None or legs.empty:
@@ -377,6 +383,7 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
             else:
                 stages.append((key, leg.to_frame().T))
         answered_yet = False
+        call_events: list[dict] = []
         for key, g in stages:
             g_start = g["ts"].min()
             g_end = g["end_ts"].max() if g["end_ts"].notna().any() else g_start
@@ -392,6 +399,20 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
             gname = f"Ring group {group_no.group(1)}" if group_no else ext_name(key[3:])
             if did and group_no:
                 did_groups.setdefault(did, []).append(gname)
+            answerer = pick.sort_values("ans_ts").iloc[0]["Callee Number"] if len(pick) else None
+            rang = g[g["Callee Number"].str.fullmatch(r"\d{2,5}") & (g["Last app."].str.lower() == "dial")]
+            for ext_, eg in rang.groupby("Callee Number"):
+                ev = {"session": session, "ts": g_start, "ext": ext_,
+                      "group": group_no.group(1) if group_no else "direct", "caller": caller_disp,
+                      "answered": ext_ == answerer, "ring_s": np.nan, "talk_s": 0,
+                      "window_s": max(0.0, (g_end - g_start).total_seconds()),
+                      "declined": bool((eg["Call Status"].str.upper() == "BUSY").any())}
+                if ext_ == answerer:
+                    pa = pick[pick["Callee Number"] == ext_].sort_values("ans_ts").iloc[0]
+                    ans_ = pa["ans_ts"] if pd.notna(pa["ans_ts"]) else g_start
+                    ev["ring_s"] = max(0.0, (ans_ - g_start).total_seconds())
+                    ev["talk_s"] = int(pa["talk_n"])
+                call_events.append(ev)
             if len(pick):
                 a = pick.sort_values("ans_ts").iloc[0]
                 ans = a["ans_ts"] if pd.notna(a["ans_ts"]) else g_start
@@ -403,6 +424,10 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
                 num = group_no.group(1) if group_no else key[3:]
                 add(f"{gname} ({num})", "Busy" if busy else "Not Answered", g_start,
                     (g_end - g_start).total_seconds(), 0)
+        for ev in call_events:
+            ev["call_answered"] = answered_yet
+            ev["call_start"] = start
+        ring_events.extend(call_events)
         if not stages:
             # nothing rang: use the main record's own outcome
             st_ = GS_STATUS.get(m["Call Status"].upper(), "Failed")
@@ -425,6 +450,22 @@ def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
     df["mos_v"] = np.nan
     df["cost_v"] = 0.0
     df["provider"] = "grandstream"
+    internal = mains[mains["Call Type"].str.lower() == "internal"]
+    df.attrs["users"] = {
+        "names": names,
+        "ring": pd.DataFrame(ring_events),
+        "transfers": pd.DataFrame(transfer_events),
+        "internal": pd.DataFrame({"ts": internal["ts"], "from_ext": internal["Caller Number"],
+                                  "to_ext": internal["Callee Number"], "talk_s": internal["talk_n"],
+                                  "status": internal["Call Status"].str.upper()}).reset_index(drop=True),
+        "outbound": pd.DataFrame({"ts": mains.loc[mains["Call Type"].str.lower() == "outbound", "ts"],
+                                  "ext": mains.loc[mains["Call Type"].str.lower() == "outbound", "Caller Number"],
+                                  "dialled": mains.loc[mains["Call Type"].str.lower() == "outbound", "Callee Number"]
+                                  .map(norm_number),
+                                  "talk_s": mains.loc[mains["Call Type"].str.lower() == "outbound", "talk_n"],
+                                  "status": mains.loc[mains["Call Type"].str.lower() == "outbound", "Call Status"]
+                                  .str.upper()}).reset_index(drop=True),
+    }
     df.attrs["dropped"] = {"transfers": transfers,
                            "internal": int(((mains["Call Type"].str.lower() == "internal")).sum())}
     return df.sort_values("ts").reset_index(drop=True)

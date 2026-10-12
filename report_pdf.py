@@ -19,6 +19,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker  # noqa: F401
 import numpy as np
 from matplotlib import font_manager
 from matplotlib.colors import LinearSegmentedColormap
@@ -319,7 +320,7 @@ def _phone_icon(c, x, y, s, col):
     c.restoreState()
 
 
-def _hero(c, T, customer, period, brand, provider, logo):
+def _hero(c, T, customer, period, brand, provider, logo, eyebrow="CALL HANDLING ASSESSMENT"):
     top = H - 12 * mm
     # brand tile (or the uploaded logo) on the right
     if logo is not None:
@@ -344,7 +345,7 @@ def _hero(c, T, customer, period, brand, provider, logo):
     c.circle(M + 1.3 * mm, top - 1.6 * mm, 1.15 * mm, stroke=0, fill=1)
     c.setFillColor(_c(T.accent2))
     c.setFont(F["b"], 6.8)
-    c.drawString(M + 5 * mm, top - 2.6 * mm, "CALL HANDLING ASSESSMENT")
+    c.drawString(M + 5 * mm, top - 2.6 * mm, eyebrow)
 
     # title: customer name with the last word in the accent colour (solid - gradient text prints badly)
     name = (customer or "Call handling assessment").strip()
@@ -383,14 +384,14 @@ def _hero(c, T, customer, period, brand, provider, logo):
     return y - 5 * mm
 
 
-def _footer(c, T, page, brand, generated):
+def _footer(c, T, page, brand, generated, total=2, doc="Call Handling Assessment"):
     c.setStrokeColor(_c(T.border))
     c.setLineWidth(0.5)
     c.line(M, 10 * mm, W - M, 10 * mm)
     c.setFillColor(_c(T.faint))
     c.setFont(F["m"], 6.3)
-    c.drawString(M, 6.5 * mm, f"{brand}  ·  Call Handling Assessment  ·  generated {generated}")
-    c.drawRightString(W - M, 6.5 * mm, f"Page {page} of 2")
+    c.drawString(M, 6.5 * mm, f"{brand}  ·  {doc}  ·  generated {generated}")
+    c.drawRightString(W - M, 6.5 * mm, f"Page {page} of {total}")
 
 
 def _card(c, T, x, y_top, w, h):
@@ -701,5 +702,302 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     _list_block(c, T, recs, M + half + gap + pad, yy, half - 2 * pad, True, size)
 
     _footer(c, T, 2, brand, generated)
+    c.save()
+    return buf.getvalue()
+
+
+# =========================================================================== #
+# User assessment PDF
+# =========================================================================== #
+def chart_workload(rep, T, w_mm, h_mm, limit=22):
+    t = rep.table.head(limit).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(w_mm / 25.4, h_mm / 25.4))
+    fig.patch.set_facecolor(T.card)
+    ax.set_facecolor(T.card)
+    y = np.arange(len(t))
+    ax.barh(y, t["answered"], color=T.accent, height=0.62, label="Inbound answered", linewidth=0)
+    ax.barh(y, t["outbound"], left=t["answered"], color=T.accent2, height=0.62, label="Outbound calls", linewidth=0)
+    top = max(1, (t["answered"] + t["outbound"]).max())
+    for yi, (a_, o_) in enumerate(zip(t["answered"], t["outbound"])):
+        ax.text(a_ + o_ + top * 0.01, yi, f"{a_ + o_:,}", va="center", fontsize=6.3, color=T.chart_text)
+    ax.set_yticks(y)
+    ax.set_yticklabels([_trunc(n, 24) for n in t["name"]])
+    ax.set_xlim(0, top * 1.1)
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(T.border_strong)
+    ax.tick_params(colors=T.chart_text, labelsize=6.6, length=0)
+    ax.grid(axis="x", color=T.grid, linewidth=0.8)
+    ax.set_axisbelow(True)
+    _legend(ax, T, ncol=2, loc="lower left", bbox_to_anchor=(0, 1.0))
+    fig.tight_layout()
+    return _fig_to_img(fig, T)
+
+
+def chart_user_hours(hp, T, w_mm, h_mm):
+    hp = hp.loc[7:19]
+    fig, ax = plt.subplots(figsize=(w_mm / 25.4, h_mm / 25.4))
+    fig.patch.set_facecolor(T.card)
+    x = np.arange(len(hp))
+    ax.bar(x, hp["inbound"], color=T.accent, width=0.7, label="In", linewidth=0)
+    ax.bar(x, hp["outbound"], bottom=hp["inbound"], color=T.accent2, width=0.7, label="Out", linewidth=0)
+    ax.set_xticks(x[::2])
+    ax.set_xticklabels([f"{h:02d}" for h in hp.index[::2]])
+    _setup_ax(ax, T)
+    ax.tick_params(labelsize=6)
+    ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(3, integer=True))
+    _legend(ax, T, ncol=2, loc="lower left", bbox_to_anchor=(0, 0.98))
+    fig.tight_layout()
+    return _fig_to_img(fig, T)
+
+
+def _chip(c, T, x, y, text, tone="plain", size=6.4):
+    tw = pdfmetrics.stringWidth(text, F["sb"], size) + 5 * mm
+    if tone == "accent":
+        fill, fg, br = T.accent_soft, T.accent if T.name == "print" else "#B9BDFF", T.accent
+    elif tone == "good":
+        fill, fg, br = T.good_soft, T.good, T.good
+    elif tone == "bad":
+        fill, fg, br = T.bad_soft, T.bad, T.bad
+    else:
+        fill, fg, br = (T.surface3 if T.name == "portal" else T.surface2), T.text, T.border
+    _round(c, x, y, tw, 4.8 * mm, 2.4 * mm, fill=fill, stroke=br, width=0.4)
+    c.setFillColor(_c(fg))
+    c.setFont(F["sb"], size)
+    c.drawString(x + 2.5 * mm, y + 1.55 * mm, text)
+    return tw
+
+
+def _mini(c, T, x, y, w, label, value, sub=""):
+    _round(c, x, y - 13 * mm, w, 13 * mm, 2.4 * mm, fill=T.surface, stroke=T.border, width=0.5)
+    c.setFillColor(_c(T.muted))
+    c.setFont(F["b"], 5.2)
+    c.drawString(x + 2.4 * mm, y - 4.2 * mm, label.upper())
+    c.setFillColor(_c(T.text))
+    c.setFont(F["xb"], 11)
+    c.drawString(x + 2.4 * mm, y - 9.4 * mm, value)
+    if sub:
+        c.setFillColor(_c(T.muted))
+        c.setFont(F["r"], 5.4)
+        c.drawString(x + 2.4 * mm, y - 12 * mm, _trunc(sub, 26))
+
+
+def _compact_header(c, T, customer, period, page_title):
+    top = H - 12 * mm
+    c.setFillColor(_c(T.accent2))
+    c.setFont(F["b"], 6.4)
+    c.drawString(M, top - 2.4 * mm, "USER ASSESSMENT")
+    c.setFillColor(_c(T.text))
+    c.setFont(F["xb"], 13)
+    c.drawString(M, top - 8.6 * mm, page_title)
+    c.setFillColor(_c(T.muted))
+    c.setFont(F["m"], 6.8)
+    c.drawRightString(W - M, top - 2.4 * mm, customer or "")
+    c.drawRightString(W - M, top - 8 * mm, period)
+    c.setStrokeColor(_c(T.border))
+    c.setLineWidth(0.6)
+    c.line(M, top - 12 * mm, W - M, top - 12 * mm)
+    return top - 16 * mm
+
+
+def _user_card(c, T, rep, ext, r, x, y_top, w, h):
+    _card(c, T, x, y_top, w, h)
+    pad = 4.5 * mm
+    full = rep.level == "full"
+    name = _trunc(r["name"], 34)
+    c.setFillColor(_c(T.text))
+    c.setFont(F["xb"], 11.5)
+    c.drawString(x + pad, y_top - pad - 4 * mm, name)
+    cx = x + pad + pdfmetrics.stringWidth(name, F["xb"], 11.5) + 3 * mm
+    cy = y_top - pad - 5 * mm
+    if full:
+        cx += _chip(c, T, cx, cy, f"Ext {ext}", "accent") + 1.5 * mm
+        for g in [g for g in str(r["groups"]).split(", ") if g][:3]:
+            cx += _chip(c, T, cx, cy, f"Group {g}") + 1.5 * mm
+    share = r["share_pct"]
+    if share == share and share > 0:
+        tag = f"{share:.0f}% of team's answered calls"
+        tw = pdfmetrics.stringWidth(tag, F["sb"], 6.4) + 5 * mm
+        _chip(c, T, x + w - pad - tw, cy, tag, "good" if share >= 10 else "plain")
+
+    if full:
+        stats = [("Rang them", f"{int(r['rang']):,}", f"{int(r['lost'])} lost while ringing"),
+                 ("Answered", f"{int(r['answered']):,}",
+                  f"pick-up {r['pickup_pct']:.0f}%" if r["pickup_pct"] == r["pickup_pct"] else ""),
+                 ("Avg answer", fmt_dur(r["avg_ring_s"]), "time to pick up"),
+                 ("Outbound", f"{int(r['outbound']):,}",
+                  f"{r['connect_pct']:.0f}% connected" if r["connect_pct"] == r["connect_pct"] else ""),
+                 ("Talk time", fmt_dur(r["talk_s"]), f"{int(r['internal_made'])} internal calls"),
+                 ("Returned", f"{int(r['returned']):,}", "missed calls")]
+    else:
+        stats = [("Answered", f"{int(r['answered']):,}", ""), ("Avg answer", fmt_dur(r["avg_ring_s"]), ""),
+                 ("Outbound", f"{int(r['outbound']):,}", ""),
+                 ("Connected", f"{r['connect_pct']:.0f}%" if r["connect_pct"] == r["connect_pct"] else "-", ""),
+                 ("Talk time", fmt_dur(r["talk_s"]), ""), ("Returned", f"{int(r['returned']):,}", "missed calls")]
+    sg = 2 * mm
+    sw = (w - 2 * pad - sg * 5) / 6
+    sy = y_top - pad - 9 * mm
+    for i, (l_, v, sub) in enumerate(stats):
+        _mini(c, T, x + pad + i * (sw + sg), sy, sw, l_, v, sub)
+
+    by = sy - 13 * mm - 3.5 * mm
+    avail_h = by - (y_top - h) - pad
+    lw_ = (w - 2 * pad) * 0.6
+    obs = rep.observations.get(ext, [])
+    size = 7.0
+    for size in (7.0, 6.7, 6.4, 6.1, 5.8):
+        if _list_height(T, obs, lw_, size) <= avail_h:
+            break
+    while obs and _list_height(T, obs, lw_, size) > avail_h:
+        obs = obs[:-1]
+    _list_block(c, T, obs, x + pad, by, lw_, False, size)
+    cw_ = (w - 2 * pad) - lw_ - 4 * mm
+    hp = rep.hourly.get(ext)
+    if hp is not None and hp.values.sum() > 0:
+        c.setFillColor(_c(T.muted))
+        c.setFont(F["b"], 5.4)
+        c.drawString(x + w - pad - cw_, by - 1.8 * mm, "CALLS BY HOUR")
+        ch_h = avail_h - 4 * mm
+        c.drawImage(chart_user_hours(hp, T, cw_ / mm, ch_h / mm), x + w - pad - cw_, by - 3 * mm - ch_h, cw_, ch_h)
+
+
+def build_user_pdf(a: Analysis, rep, customer: str = "", brand: str = "SY Communications",
+                   accent: str | None = None, logo: bytes | None = None, style: str = "portal") -> bytes:
+    T = Theme(style, accent)
+    t = rep.table
+    tm = rep.team
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle(f"User Assessment - {customer}".strip(" -"))
+    c.setAuthor(brand)
+    period = f"{a.period_start:%d %b %Y} → {a.period_end:%d %b %Y}"
+    generated = datetime.now().strftime("%d %b %Y")
+    gap, pad = 4 * mm, 4.5 * mm
+    people = t[(t["handled"] > 0) | (t["rang"] >= 40)]
+    per_page = 3
+    total = 2 + int(np.ceil(len(people) / per_page))
+    doc = "User Assessment"
+
+    # ---------- page 1: team summary ----------
+    _page_bg(c, T)
+    y = _hero(c, T, customer, period, brand, a.provider, logo, eyebrow="USER ASSESSMENT")
+    tiles = [
+        ("People active", f"{tm['people']:,}", "made or answered calls", T.accent),
+        ("Inbound answered", f"{tm['answered']:,}", f"top: {tm['top']}", T.good),
+        ("Outbound calls", f"{tm['outbound']:,}",
+         f"{tm['connect_pct']:.0f}% connected" if tm["connect_pct"] == tm["connect_pct"] else "", T.accent2),
+        ("Avg time to answer", fmt_dur(tm["avg_ring_s"]), "across the team", T.accent),
+        ("Talk time", fmt_dur(tm["talk_s"]), "inbound + outbound", T.accent),
+        ("Missed calls returned", f"{tm['returned']:,}", f"{a.kpis['unreturned_callers']} callers still waiting",
+         T.good if tm["returned"] else T.warn),
+    ]
+    tg = 2.6 * mm
+    tw = (CW - tg * 5) / 6
+    for i, (l_, v, sub, tone) in enumerate(tiles):
+        _kpi(c, T, M + i * (tw + tg), y, tw, 21 * mm, l_, v, sub, tone)
+    y -= 21 * mm + gap
+
+    n = min(22, len(t))
+    chart_h = max(40, 9 + 4.6 * n)
+    ch = 7.6 * mm + 3.5 * mm + chart_h * mm + 2 * pad
+    _card(c, T, M, y, CW, ch)
+    yy = _section(c, T, "01", "Who handles the calls", "Inbound calls answered and outbound calls made, per person",
+                  M + pad, y - pad)
+    c.drawImage(chart_workload(rep, T, (CW - 2 * pad) / mm, chart_h), M + pad, yy - chart_h * mm, CW - 2 * pad,
+                chart_h * mm)
+    y -= ch + gap
+
+    avail = y - 13 * mm
+    obs = list(rep.team_observations)
+    size = 7.6
+    for size in (7.6, 7.2, 6.8, 6.4, 6.0):
+        if 7.6 * mm + 3.5 * mm + _list_height(T, obs, CW - 2 * pad, size) + 2 * pad <= avail:
+            break
+    while obs and 7.6 * mm + 3.5 * mm + _list_height(T, obs, CW - 2 * pad, size) + 2 * pad > avail:
+        obs = obs[:-1]
+    ch = 7.6 * mm + 3.5 * mm + _list_height(T, obs, CW - 2 * pad, size) + 2 * pad
+    _card(c, T, M, y, CW, ch)
+    yy = _section(c, T, "02", "Team observations", "", M + pad, y - pad)
+    _list_block(c, T, obs, M + pad, yy, CW - 2 * pad, False, size)
+    _footer(c, T, 1, brand, generated, total, doc)
+    c.showPage()
+
+    # ---------- page 2: overview table ----------
+    _page_bg(c, T)
+    y = _compact_header(c, T, customer, period, "Team overview")
+    full = rep.level == "full"
+    if full:
+        head = ["NAME", "EXT", "RANG", "ANSWERED", "PICK-UP", "AVG ANS.", "LOST", "OUTBOUND", "CONN.", "TALK",
+                "RETURNED"]
+        fr = (0.2, 0.06, 0.07, 0.09, 0.08, 0.08, 0.06, 0.09, 0.07, 0.1, 0.1)
+    else:
+        head = ["NAME", "ANSWERED", "SHARE", "AVG ANS.", "OUTBOUND", "CONN.", "TALK", "RETURNED"]
+        fr = (0.28, 0.1, 0.09, 0.1, 0.1, 0.09, 0.12, 0.12)
+    rows, tones = [head], {}
+    max_rows = int((y - 40 * mm - 5.6 * mm) // (5.0 * mm))
+    for i, (e, r) in enumerate(t.head(max_rows).iterrows(), 1):
+        pick = f"{r['pickup_pct']:.0f}%" if r["pickup_pct"] == r["pickup_pct"] else "-"
+        conn = f"{r['connect_pct']:.0f}%" if r["connect_pct"] == r["connect_pct"] else "-"
+        if full:
+            rows.append([_trunc(r["name"], 24), e, f"{int(r['rang']):,}", f"{int(r['answered']):,}", pick,
+                         fmt_dur(r["avg_ring_s"]), f"{int(r['lost']):,}", f"{int(r['outbound']):,}", conn,
+                         fmt_dur(r["talk_s"]), f"{int(r['returned']):,}"])
+            if r["rang"] >= 40:
+                p_ = r["pickup_pct"]
+                tones[(i, 4)] = T.good if p_ >= 20 else (T.warn if p_ >= 5 else T.bad)
+        else:
+            rows.append([_trunc(r["name"], 30), f"{int(r['answered']):,}", f"{r['share_pct']:.0f}%",
+                         fmt_dur(r["avg_ring_s"]), f"{int(r['outbound']):,}", conn, fmt_dur(r["talk_s"]),
+                         f"{int(r['returned']):,}"])
+    tbl_h = 5.6 * mm + 5.0 * mm * (len(rows) - 1)
+    note = ("<b>Rang</b>: inbound calls that rang this person's handset. <b>Pick-up</b>: share of those they "
+            "answered (ring groups ring several people at once, so a low figure is normal in a large group, but "
+            "near zero means calls are ringing someone who never answers). <b>Lost</b>: calls that rang them and were "
+            "never answered by anyone. <b>Returned</b>: missed calls they later rang back and spoke to the caller."
+            if full else
+            "Bicom exports show who answered and who dialled out, but not every handset that rang, so pick-up rate "
+            "and calls lost while ringing aren't available.")
+    nh = _para_h(note, CW - 2 * pad, _style(T, 6.4, T.muted, leading=8.8))
+    ch = 7.6 * mm + 3.5 * mm + tbl_h + 2 * pad + nh + 3 * mm
+    _card(c, T, M, y, CW, ch)
+    yy = _section(c, T, "03", "Every person at a glance", f"{len(t)} extensions with activity in the period",
+                  M + pad, y - pad)
+    _table(c, T, rows, M + pad, yy, [(CW - 2 * pad) * f for f in fr], tone_col=tones, font=6.4)
+    _para(c, note, M + pad, yy - tbl_h - 3 * mm, CW - 2 * pad, _style(T, 6.4, T.muted, leading=8.8))
+    y -= ch + gap
+
+    gt = getattr(rep, "group_table", None)
+    if gt is not None and len(gt):
+        grows = [["RING GROUP", "MEMBERS", "CALLS", "ANSWERED", "ANSWER %", "LOST", "PEOPLE ANSWERING",
+                  "TOP ANSWERER"]]
+        gtones = {}
+        for i, g in enumerate(gt.sort_values("calls", ascending=False).itertuples(), 1):
+            grows.append([f"Ring group {g.group}", f"{g.members}", f"{g.calls:,}", f"{g.answered:,}",
+                          f"{g.answer_pct:.0f}%", f"{g.lost:,}", f"{g.answering_people} of {g.members}",
+                          f"{_trunc(g.top, 18)} ({g.top_pct:.0f}%)" if g.top_pct == g.top_pct else "-"])
+            gtones[(i, 4)] = T.good if g.answer_pct >= a.settings.answer_target_pct else T.warn
+        gh = 5.6 * mm + 5.0 * mm * (len(grows) - 1)
+        ch = 7.6 * mm + 3.5 * mm + gh + 2 * pad
+        if y - ch > 13 * mm:
+            _card(c, T, M, y, CW, ch)
+            yy = _section(c, T, "04", "Ring groups", "How each group's calls were shared out", M + pad, y - pad)
+            _table(c, T, grows, M + pad, yy, [(CW - 2 * pad) * f for f in (0.14, 0.09, 0.09, 0.1, 0.1, 0.08, 0.16,
+                                                                             0.24)], tone_col=gtones, font=6.6)
+    _footer(c, T, 2, brand, generated, total, doc)
+    c.showPage()
+
+    # ---------- pages 3+: a card per person ----------
+    page = 3
+    ids = list(people.index)
+    for start_i in range(0, len(ids), per_page):
+        _page_bg(c, T)
+        y = _compact_header(c, T, customer, period, "Individual assessments")
+        card_h = (y - 13 * mm - gap * (per_page - 1)) / per_page
+        for e in ids[start_i:start_i + per_page]:
+            _user_card(c, T, rep, e, t.loc[e], M, y, CW, card_h)
+            y -= card_h + gap
+        _footer(c, T, page, brand, generated, total, doc)
+        c.showPage()
+        page += 1
     c.save()
     return buf.getvalue()

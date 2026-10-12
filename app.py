@@ -12,7 +12,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import cdr_engine as ce
-from report_pdf import build_pdf
+import users as us
+from report_pdf import build_pdf, build_user_pdf
 
 st.set_page_config(page_title="Call Insights", page_icon="📞", layout="wide")
 
@@ -161,6 +162,16 @@ def run_analysis(df: pd.DataFrame, start, end, settings_tuple):
 @st.cache_data(show_spinner=False)
 def make_pdf(_a, key, customer, brand, accent, logo, style):
     return build_pdf(_a, customer, brand, accent, logo, style)
+
+
+@st.cache_data(show_spinner=False)
+def make_user_report(df, _a, key, start, end):
+    return us.build_user_report(df, _a, start, end)
+
+
+@st.cache_data(show_spinner=False)
+def make_user_pdf(_a, _rep, key, customer, brand, accent, logo, style):
+    return build_user_pdf(_a, _rep, customer, brand, accent, logo, style)
 
 
 # --------------------------------------------------------------------------- #
@@ -323,7 +334,10 @@ elif a is not None:
             f'<div class="pe-kpi {t}"><div class="l">{esc(l)}</div><div class="v">{esc(v)}</div>'
             f'<div class="s">{esc(sub)}</div></div>' for l, v, sub, t in tiles) + "</div>")
 
-        tabs = st.tabs(["Overview", "Missed calls", "Un-returned callers", "Lines & team", "Insights"])
+        data_id = (a.provider, len(a.inbound), len(a.outbound), str(a.inbound["call_id"].head(20).tolist()))
+        urep = make_user_report(df, a, (data_id, settings_tuple), p_start, p_end)
+        tabs = st.tabs(["Overview", "Missed calls", "Un-returned callers", "Lines & team", "Insights",
+                        "User assessment"])
 
         with tabs[0]:
             render_html(f'<div class="pe-summary">{esc(a.summary)}</div>')
@@ -449,6 +463,99 @@ elif a is not None:
                     f'<li><span class="b">{i}</span><span>{esc(r)}</span></li>'
                     for i, r in enumerate(a.recommendations, 1)) + "</ul>")
 
+        with tabs[5]:
+            if not urep.available:
+                render_html(f'<div class="pe-empty"><div class="ic">{ICON_PHONE}</div><div>'
+                            f'<div class="t">User assessment not available</div>'
+                            f'<ol><li>{esc(urep.note)}</li><li>Grandstream UCM exports give the fullest per-person '
+                            f'detail; Bicom gives a lighter version.</li></ol></div></div>')
+            else:
+                tm = urep.team
+                if urep.note:
+                    st.caption(urep.note)
+                utiles = [
+                    ("People active", f"{tm['people']:,}", "made or answered calls", ""),
+                    ("Inbound answered", f"{tm['answered']:,}", f"top: {tm['top']}", "good"),
+                    ("Outbound calls", f"{tm['outbound']:,}",
+                     f"{tm['connect_pct']:.0f}% connected" if tm["connect_pct"] == tm["connect_pct"] else "", "cyan"),
+                    ("Avg time to answer", ce.fmt_dur(tm["avg_ring_s"]), "across the team", ""),
+                    ("Talk time", ce.fmt_dur(tm["talk_s"]), "inbound + outbound", ""),
+                    ("Missed calls returned", f"{tm['returned']:,}", f"{k['unreturned_callers']} callers still waiting",
+                     "good" if tm["returned"] else "warn"),
+                ]
+                render_html('<div class="pe-kpis">' + "".join(
+                    f'<div class="pe-kpi {t_}"><div class="l">{esc(l_)}</div><div class="v">{esc(v_)}</div>'
+                    f'<div class="s">{esc(sub_)}</div></div>' for l_, v_, sub_, t_ in utiles) + "</div>")
+                st.markdown('<div class="pe-h">Team observations</div>', unsafe_allow_html=True)
+                render_html('<ul class="pe-list">' + "".join(
+                    f'<li><span class="b">•</span><span>{esc(o)}</span></li>' for o in urep.team_observations) + "</ul>")
+
+                st.markdown('<div class="pe-h">Every person at a glance</div>', unsafe_allow_html=True)
+                uv = us.user_table_view(urep)
+                cfg = {}
+                if "Pick-up %" in uv:
+                    cfg["Pick-up %"] = st.column_config.ProgressColumn("Pick-up %", min_value=0, max_value=100,
+                                                                       format="%.0f%%")
+                cfg["Share of team %"] = st.column_config.ProgressColumn("Share of team %", min_value=0,
+                                                                         max_value=max(1.0, float(uv["Share of team %"].max())),
+                                                                         format="%.1f%%")
+                show_df(uv, column_config=cfg, height=min(560, 38 + 35 * len(uv)))
+                if len(urep.group_table):
+                    st.markdown('<div class="pe-h">Ring groups</div>', unsafe_allow_html=True)
+                    g = urep.group_table.sort_values("calls", ascending=False)
+                    show_df(pd.DataFrame({
+                        "Ring group": g["group"], "Members": g["members"], "Calls": g["calls"],
+                        "Answered": g["answered"], "Answer %": g["answer_pct"].round(0), "Lost": g["lost"],
+                        "People answering": g["answering_people"].astype(str) + " of " + g["members"].astype(str),
+                        "Top answerer": g["top"] + " (" + g["top_pct"].round(0).astype(int).astype(str) + "%)"}))
+
+                st.markdown('<div class="pe-h">Individual assessment</div>', unsafe_allow_html=True)
+                t_ = urep.table
+                people = t_[(t_["handled"] > 0) | (t_["rang"] >= 40)]
+                pick_e = st.selectbox("Person", list(people.index),
+                                      format_func=lambda e: f"{t_.loc[e, 'name']}" + (
+                                          f"  (ext {e})" if urep.level == "full" else ""))
+                r = t_.loc[pick_e]
+                chips_ = chip(f"Ext {pick_e}", "accent") if urep.level == "full" else ""
+                for g_ in [g_ for g_ in str(r["groups"]).split(", ") if g_]:
+                    chips_ += chip(f"Ring group {g_}")
+                if r["share_pct"] == r["share_pct"] and r["share_pct"] > 0:
+                    chips_ += chip(f"{r['share_pct']:.0f}% of team's answered calls", "good")
+                render_html(chips_)
+                pt = [
+                    ("Rang them", f"{int(r['rang']):,}", f"{int(r['lost'])} lost while ringing", ""),
+                    ("Answered", f"{int(r['answered']):,}",
+                     f"pick-up {r['pickup_pct']:.0f}%" if r["pickup_pct"] == r["pickup_pct"] else "", "good"),
+                    ("Avg time to answer", ce.fmt_dur(r["avg_ring_s"]), "time to pick up", ""),
+                    ("Outbound", f"{int(r['outbound']):,}",
+                     f"{r['connect_pct']:.0f}% connected" if r["connect_pct"] == r["connect_pct"] else "", "cyan"),
+                    ("Talk time", ce.fmt_dur(r["talk_s"]), f"{int(r['internal_made'])} internal calls", ""),
+                    ("Missed calls returned", f"{int(r['returned']):,}", "rang back and spoke", ""),
+                ]
+                if urep.level != "full":
+                    pt[0] = ("Share of team", f"{r['share_pct']:.0f}%", "of answered calls", "")
+                render_html('<div class="pe-kpis">' + "".join(
+                    f'<div class="pe-kpi {t2}"><div class="l">{esc(l2)}</div><div class="v">{esc(v2)}</div>'
+                    f'<div class="s">{esc(s2)}</div></div>' for l2, v2, s2, t2 in pt) + "</div>")
+                uc1, uc2 = st.columns([1.1, 1])
+                with uc1:
+                    render_html('<ul class="pe-list">' + "".join(
+                        f'<li><span class="b">•</span><span>{esc(o)}</span></li>'
+                        for o in urep.observations.get(pick_e, [])) + "</ul>")
+                with uc2:
+                    hp = urep.hourly.get(pick_e)
+                    if hp is not None and hp.values.sum():
+                        hp = hp.loc[7:19]
+                        fu = go.Figure()
+                        fu.add_bar(x=[f"{h:02d}:00" for h in hp.index], y=hp["inbound"], name="Inbound answered",
+                                   marker_color="#7C83FF")
+                        fu.add_bar(x=[f"{h:02d}:00" for h in hp.index], y=hp["outbound"], name="Outbound",
+                                   marker_color="#38D6F5")
+                        plot_layout(fu, 280).update_layout(title=dict(text="Calls by hour", font=dict(size=14)))
+                        show_chart(fu)
+                st.download_button("Download user table (CSV)", uv.to_csv(index=False).encode(),
+                                   "user_assessment.csv", "text/csv")
+
     # ----------------------------------------------------------------------- #
     # 04 Report
     # ----------------------------------------------------------------------- #
@@ -465,6 +572,22 @@ elif a is not None:
         c1, c2 = st.columns([1, 2])
         c1.download_button("Download PDF report", pdf, fname, "application/pdf", type="primary", **FULL_WIDTH)
         c2.caption("Tip: add the customer's name and your logo in the sidebar before downloading.")
+        if urep.available:
+            n_people = int(((urep.table["handled"] > 0) | (urep.table["rang"] >= 40)).sum())
+            st.markdown('<div class="pe-h" style="margin-top:14px">User assessment</div>', unsafe_allow_html=True)
+            u_key = ("upk", pdf_key, style)
+            c3, c4 = st.columns([1, 2])
+            if st.session_state.get("user_pdf_key") == u_key:
+                with st.spinner("Building user assessment PDF..."):
+                    updf = make_user_pdf(a, urep, u_key, customer, brand, accent, logo, style)
+                c3.download_button("Download user assessment PDF", updf,
+                                   fname.replace("Call_Assessment", "User_Assessment"), "application/pdf",
+                                   type="primary", **FULL_WIDTH)
+            elif c3.button("Build user assessment PDF", **FULL_WIDTH):
+                st.session_state["user_pdf_key"] = u_key
+                st.rerun()
+            c4.caption(f"Team overview, ring groups and a one-card assessment for each of the {n_people} people - "
+                       f"{2 + -(-n_people // 3)} pages.")
         stage = 4
 
 # --------------------------------------------------------------------------- #
