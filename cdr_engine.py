@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
@@ -97,13 +98,155 @@ def load_cdr(raw: bytes) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def load_many(files: list[bytes]) -> pd.DataFrame:
-    frames = [load_cdr(f) for f in files]
+PROVIDERS = {
+    "bicom": "Bicom",
+    "trusip": "TruSIP",
+}
+
+# What each provider's export can tell us. TruSIP logs one row per call at trunk level,
+# so there are no ring groups, overflow legs, extensions, ring times or MOS scores.
+CAPS = {
+    "bicom": {"routing": True, "ring_time": True},
+    "trusip": {"routing": False, "ring_time": False},
+}
+
+
+def detect_provider(raw: bytes) -> str | None:
+    """Best guess at which PBX produced a file (used to warn about a wrong dropdown choice)."""
+    try:
+        head = _decode(raw[:4000]).splitlines()[0].lower()
+    except Exception:  # noqa: BLE001
+        return None
+    if "dial status" in head and "called comments" in head:
+        return "trusip"
+    if re.search(r"\d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2}", head) or "\t" in head:
+        return "bicom"
+    return None
+
+
+def _clean_label(v: str) -> str:
+    v = re.sub(r"(?i)\bdummy\b", "", str(v)).replace("_", " ")
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def load_trusip(raw: bytes) -> pd.DataFrame:
+    """Convert a TruSIP call-log export into the same leg format the Bicom reader produces.
+
+    TruSIP columns: Unique ID, Date/Time (dd/mm/yyyy), Type (INBOUND/OUTBOUND), Dial Status,
+    Caller Number, Caller Extension, Caller Comments, Called Number, Called Comments,
+    Answering Extension, Duration (seconds), ...
+    """
+    text = _decode(raw)
+    with warnings.catch_warnings():  # rows carry trailing commas beyond the header
+        warnings.simplefilter("ignore")
+        t = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, index_col=False)
+    t.columns = [c.strip().lower() for c in t.columns]
+    t = t.apply(lambda c: c.str.strip())
+    need = ["date/time", "type", "dial status", "caller number", "called number", "duration"]
+    missing = [c for c in need if c not in t.columns]
+    if missing:
+        raise ValueError(f"not a TruSIP export - missing column(s): {', '.join(missing)}")
+    for c in ("unique id", "caller comments", "called comments", "answering extension"):
+        if c not in t:
+            t[c] = ""
+
+    t["ts"] = pd.to_datetime(t["date/time"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    if t["ts"].isna().mean() > 0.5:
+        t["ts"] = pd.to_datetime(t["date/time"], dayfirst=True, errors="coerce")
+    t = t.dropna(subset=["ts"]).reset_index(drop=True)
+    t["type"] = t["type"].str.upper()
+    t["secs"] = pd.to_numeric(t["duration"], errors="coerce").fillna(0).round().astype(int)
+    t["caller_n"] = t["caller number"].map(norm_number)
+    t["called_n"] = t["called number"].map(norm_number)
+
+    inb = t[t["type"] == "INBOUND"]
+    out = t[t["type"] == "OUTBOUND"]
+
+    # Outbound rows that carry an outside caller's number within seconds of an inbound call from
+    # that number are the forwarding leg of the inbound call - not a call made by the business.
+    fwd = pd.Series(False, index=out.index)
+    if len(inb) and len(out):
+        by_caller = inb.groupby("caller_n")["ts"].apply(list).to_dict()
+        for i, r in out.iterrows():
+            for ts in by_caller.get(r["caller_n"], ()):
+                if abs((r["ts"] - ts).total_seconds()) <= 15:
+                    fwd[i] = True
+                    break
+    own_clis = set(out.loc[~fwd, "caller_n"]) - {""}
+    dids = set(inb["called_n"]) - {""}
+    own = own_clis | dids
+
+    # Friendly names for the business's own numbers
+    names: dict[str, str] = {}
+    for num in own:
+        cands = list(inb.loc[inb["called_n"] == num, "called comments"]) + \
+            list(t.loc[t["caller_n"] == num, "caller comments"]) + list(out.loc[out["called_n"] == num, "called comments"])
+        cands = [_clean_label(c) for c in cands if c and not c.lower().startswith("trunk")]
+        cands = [c for c in cands if c]
+        if cands:
+            names[num] = pd.Series(cands).value_counts().index[0]
+
+    internal_in = inb["caller_n"].isin(own)
+    internal_out = out["called_n"].isin(own)
+    keep_in = inb[~internal_in]
+    keep_out = out[~fwd & ~internal_out]
+
+    status_map = {"answered": "Answered", "missed": "Not Answered", "no answer": "Not Answered",
+                  "busy": "Busy", "failed": "Failed", "cancelled": "Not Answered", "abandoned": "Not Answered"}
+
+    def norm_status(v: str) -> str:
+        v = str(v).lower()
+        for k_, val in status_map.items():
+            if v.startswith(k_):
+                return val
+        return "Failed"
+
+    rows = []
+    for i, r in keep_in.iterrows():
+        st_ = norm_status(r["dial status"])
+        secs = int(r["secs"])
+        if st_ == "Answered":
+            secs = max(secs, 1)  # TruSIP sometimes logs an answered call as 0s
+        caller = r["caller_n"] if r["caller_n"] else (r["caller number"] or "anonymous")
+        rows.append({
+            "src": caller, "dst": r["called_n"], "start": r["date/time"], "duration": "", "talk": "",
+            "cost": "", "status": st_, "uid": f"{int(r['ts'].timestamp())}.{i}", "clid": caller, "mos": "",
+            "ts": r["ts"], "duration_s": secs if st_ == "Answered" else 0, "talk_s": secs if st_ == "Answered" else 0,
+            "dst_label": names.get(r["called_n"], ""),
+        })
+    for i, r in keep_out.iterrows():
+        cli = r["caller_n"]
+        site = names.get(cli)
+        who = f"{site} \u00b7 {pretty_number(cli)}" if site else pretty_number(cli)
+        st_ = norm_status(r["dial status"])
+        rows.append({
+            "src": f"{who} ({re.sub(r'\\D', '', cli) or '0'})", "dst": r["called_n"], "start": r["date/time"],
+            "duration": "", "talk": "", "cost": "", "status": st_, "uid": f"{int(r['ts'].timestamp())}.{i}",
+            "clid": f"<{cli}>", "mos": "", "ts": r["ts"], "duration_s": int(r["secs"]), "talk_s": int(r["secs"]),
+            "dst_label": "",
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("no calls found in the TruSIP file")
+    df["mos_v"] = np.nan
+    df["cost_v"] = 0.0
+    df["provider"] = "trusip"
+    df.attrs["dropped"] = {"internal": int(internal_in.sum() + internal_out.sum()), "forwarded_legs": int(fwd.sum())}
+    return df.sort_values("ts").reset_index(drop=True)
+
+
+def load_many(files: list[bytes], provider: str = "bicom") -> pd.DataFrame:
+    loader = load_trusip if provider == "trusip" else load_cdr
+    frames = [loader(f) for f in files]
     if len(frames) == 1:
-        return frames[0]
-    # overlapping exports: drop rows that appear in more than one file
-    df = pd.concat(frames, ignore_index=True)
-    return df.drop_duplicates(subset=STD_COLS).reset_index(drop=True)
+        df = frames[0]
+    else:
+        # overlapping exports: drop rows that appear in more than one file
+        df = pd.concat(frames, ignore_index=True)
+        key = ["src", "dst", "start", "status"] + (["uid"] if provider != "trusip" else [])
+        df = df.drop_duplicates(subset=key).reset_index(drop=True)
+    df["provider"] = provider
+    return df
 
 
 def _to_seconds(v) -> int:
@@ -252,9 +395,16 @@ def line_labels(df: pd.DataFrame) -> dict[str, str]:
     for did, n in ivr_hits.items():
         if n >= 5:
             labels[did] = "IVR / main menu"
+    # Providers that name their inbound numbers (e.g. TruSIP "Chester_Sales Dummy")
+    if "dst_label" in df:
+        named = inb[inb["dst_label"].fillna("") != ""]
+        for did, g in named.groupby("dst_num"):
+            if did:
+                labels[did] = g["dst_label"].value_counts().index[0]
     final = {}
     for did, name in labels.items():
-        final[did] = f"{name} \u00b7 {pretty_number(did)}" if did.startswith("0") else name
+        pn = pretty_number(did)
+        final[did] = f"{name} \u00b7 {pn}" if did.startswith("0") and pn not in name else name
     return final
 
 
@@ -433,6 +583,8 @@ class Analysis:
     recommendations: list = field(default_factory=list)
     summary: str = ""
     settings: Settings = field(default_factory=Settings)
+    provider: str = "bicom"
+    caps: dict = field(default_factory=lambda: dict(CAPS["bicom"]))
 
 
 def in_hours(ts: pd.Series, s: Settings) -> pd.Series:
@@ -463,6 +615,8 @@ def fmt_mins(m: float) -> str:
 
 def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = None) -> Analysis:
     s = s or Settings()
+    provider = str(raw_df["provider"].iloc[0]) if "provider" in raw_df and len(raw_df) else "bicom"
+    caps = dict(CAPS.get(provider, CAPS["bicom"]))
     df = prepare(raw_df)
     labels = line_labels(df)
     data_end = df["ts"].max()
@@ -476,8 +630,10 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
     outb_all = build_outbound_calls(df)
 
     # short abandons: caller gave up almost immediately - not a real chance to answer
-    sa = inb_all["outcome"].isin(["Missed"]) & (inb_all["ring_s"] < s.short_abandon_s)
-    inb_all.loc[sa, "outcome"] = "Short abandon"
+    # (only possible when the export records how long the call rang)
+    if caps["ring_time"]:
+        sa = inb_all["outcome"].isin(["Missed"]) & (inb_all["ring_s"] < s.short_abandon_s)
+        inb_all.loc[sa, "outcome"] = "Short abandon"
 
     missed_all = track_returns(inb_all, outb_all, data_end, s)
 
@@ -543,8 +699,10 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
         "median_callback_min": float(returned_by_us["minutes_to_follow_up"].median()) if len(returned_by_us) else np.nan,
         "callback_within_target_pct": 100 * (returned_by_us["minutes_to_follow_up"] <= s.callback_target_min).mean()
         if len(returned_by_us) else np.nan,
-        "avg_ring_s": float(answered["ring_s"].mean()) if len(answered) else np.nan,
-        "avg_ring_first_s": float(answered[answered["outcome"] == "Answered"]["ring_s"].mean()) if len(answered) else np.nan,
+        "avg_ring_s": float(answered["ring_s"].mean()) if len(answered) and caps["ring_time"] else np.nan,
+        "avg_ring_first_s": float(answered[answered["outcome"] == "Answered"]["ring_s"].mean())
+        if len(answered) and caps["ring_time"] else np.nan,
+        "busy": int((missed["outcome"] == "Busy").sum()),
         "avg_talk_s": float(answered["talk_s"].mean()) if len(answered) else np.nan,
         "outbound_total": len(outb),
         "outbound_connected": int(outb["connected"].sum()),
@@ -573,8 +731,9 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
     daily = hrs.assign(day=hrs["ts"].dt.date).groupby("day").agg(calls=("call_id", "count"), answered=("ans", "sum"))
     daily["missed"] = daily["calls"] - daily["answered"]
 
-    lines = counted.assign(ans=ans_mask, ovf=counted["outcome"] == "Answered via overflow").groupby("line_name").agg(
-        calls=("call_id", "count"), answered=("ans", "sum"), overflow=("ovf", "sum"))
+    lines = counted.assign(ans=ans_mask, ovf=counted["outcome"] == "Answered via overflow",
+                           bsy=counted["outcome"] == "Busy").groupby("line_name").agg(
+        calls=("call_id", "count"), answered=("ans", "sum"), overflow=("ovf", "sum"), busy=("bsy", "sum"))
     lines["missed"] = lines["calls"] - lines["answered"]
     lines["answer_rate"] = 100 * lines["answered"] / lines["calls"]
     unret_by_line = unreturned_callers.groupby("line_name").size()
@@ -586,7 +745,8 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
     cb = returned_by_us.groupby("follow_up_by").size()
     team["missed_calls_returned"] = cb.reindex(team.index).fillna(0).astype(int)
 
-    a = Analysis(start, end, inb, outb, missed, k, hourly, heat, daily, lines, team, unreturned_callers, settings=s)
+    a = Analysis(start, end, inb, outb, missed, k, hourly, heat, daily, lines, team, unreturned_callers, settings=s,
+                 provider=provider, caps=caps)
     _write_insights(a)
     return a
 
@@ -603,22 +763,38 @@ def _write_insights(a: Analysis) -> None:
 
     ar = k["answer_rate_ih"]
     hidden = max(0, k["pbx_reported_missed"] - k["true_missed"])
+    routing = a.caps.get("routing", True)
+    if routing:
+        middle = (f"The phone system's own log shows {k['pbx_reported_missed']:,} 'not answered' entries, but once "
+                  f"ring-group overflow and call routing are stitched together only {k['true_missed']:,} calls were "
+                  f"truly missed. ")
+    else:
+        middle = (f"{k['true_missed']:,} calls were missed"
+                  + (f", including {k['busy']:,} callers who heard an engaged tone" if k["busy"] else "") + ". ")
     a.summary = (
         f"Between {a.period_start:%d %b %Y} and {a.period_end:%d %b %Y} the business received "
         f"{k['inbound_total']:,} genuine inbound calls ({k['avg_inbound_per_open_day']:.0f} per working day). "
-        f"During opening hours {ar:.1f}% were answered by a person"
+        f"During opening hours {ar:.1f}% were answered"
         f"{' - above' if ar >= s.answer_target_pct else ' - below'} the {s.answer_target_pct:.0f}% benchmark. "
-        f"The phone system's own log shows {k['pbx_reported_missed']:,} 'not answered' entries, but once ring-group "
-        f"overflow and call routing are stitched together only {k['true_missed']:,} calls were truly missed. "
+        + middle +
         f"Of the missed calls we can judge, {k['missed_resolved_pct']:.0f}% were followed up successfully, leaving "
         f"{k['unreturned_callers']:,} callers who never got a conversation."
     )
 
-    if hidden > 0:
+    if hidden > 0 and routing:
         obs.append(f"{hidden:,} of the PBX's 'not answered' entries were not lost calls - they were answered by an "
                    f"overflow group or are internal routing legs. The raw log overstates missed calls by "
                    f"{100 * hidden / max(1, k['pbx_reported_missed']):.0f}%.")
-    if k["answered"]:
+    if k["answered"] and not routing:
+        obs.append(f"Answered calls lasted {fmt_dur(k['avg_talk_s'])} on average.")
+    if k["busy"]:
+        bp = 100 * k["busy"] / max(1, k["true_missed"])
+        obs.append(f"{k['busy']:,} callers ({bp:.0f}% of missed calls) got an engaged tone - every line or handset "
+                   f"was busy, so the call never rang through.")
+        if k["busy"] >= 10 or bp >= 15:
+            rec.append("Reduce engaged tones: check the number of call channels, and enable call waiting or a "
+                       "queue / overflow so busy-time callers are held or redirected instead of turned away.")
+    if k["answered"] and routing:
         ov = 100 * k["answered_overflow"] / k["answered"]
         obs.append(f"{ov:.0f}% of answered calls ({k['answered_overflow']:,}) were only picked up after the first ring "
                    f"group timed out. Average time to answer was {fmt_dur(k['avg_ring_s'])} overall versus "
