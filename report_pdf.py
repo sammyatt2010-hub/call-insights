@@ -89,16 +89,19 @@ def chart_hourly(a: Analysis, w_mm, h_mm):
     tab = tab.reindex(range(lo, hi + 1), fill_value=0)
     days = max(1, a.kpis["days"])
     get = lambda col: tab[col].values / days if col in tab else np.zeros(len(tab))
-    first, ovf = get("Answered"), get("Answered via overflow")
-    missed = get("Missed") + get("Busy")
-    vm = get("Voicemail")
+    if a.caps.get("routing", True):
+        series = [("Answered", get("Answered"), C_ANS), ("Answered via overflow", get("Answered via overflow"), C_OVF),
+                  ("Missed", get("Missed") + get("Busy"), C_MISS), ("Voicemail", get("Voicemail"), C_VM)]
+    else:
+        series = [("Answered", get("Answered"), C_ANS), ("Missed (no answer)", get("Missed"), C_MISS),
+                  ("Engaged (busy)", get("Busy"), C_VM)]
 
     fig, ax = plt.subplots(figsize=(w_mm / 25.4, h_mm / 25.4))
     x = np.arange(len(tab))
-    ax.bar(x, first, color=C_ANS, width=0.72, label="Answered")
-    ax.bar(x, ovf, bottom=first, color=C_OVF, width=0.72, label="Answered via overflow")
-    ax.bar(x, missed, bottom=first + ovf, color=C_MISS, width=0.72, label="Missed")
-    ax.bar(x, vm, bottom=first + ovf + missed, color=C_VM, width=0.72, label="Voicemail")
+    bottom = np.zeros(len(tab))
+    for label, vals, col in series:
+        ax.bar(x, vals, bottom=bottom, color=col, width=0.72, label=label)
+        bottom = bottom + vals
     ax.set_xticks(x)
     ax.set_xticklabels([f"{h:02d}" for h in tab.index])
     ax.set_ylabel("Avg calls per day", fontsize=7, color="#475569")
@@ -111,7 +114,11 @@ def chart_hourly(a: Analysis, w_mm, h_mm):
 def chart_reality(a: Analysis, w_mm, h_mm):
     k = a.kpis
     fig, ax = plt.subplots(figsize=(w_mm / 25.4, h_mm / 25.4))
-    labels = ["Phone system log\n'not answered'", "Truly missed\n(after overflow)", "Never returned\n(callers)"]
+    if a.caps.get("routing", True):
+        labels = ["Phone system log\n'not answered'", "Truly missed\n(after overflow)", "Never returned\n(callers)"]
+    else:
+        labels = ["Missed calls\n(incl. engaged)", "Missed calls\nnot resolved", "Never returned\n(callers)"]
+        k = dict(k, pbx_reported_missed=k["true_missed"], true_missed=k["unreturned_calls"])
     vals = [k["pbx_reported_missed"], k["true_missed"], k["unreturned_callers"]]
     cols = ["#CBD5E1", C_MISS, "#991B1B"]
     bars = ax.barh(labels[::-1], vals[::-1], color=cols[::-1], height=0.58)
@@ -297,16 +304,21 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     y = _header(c, "Call Handling Assessment", customer, period, brand, accent, logo) - 7 * mm
 
     ar = k["answer_rate_ih"]
+    routing, ring = a.caps.get("routing", True), a.caps.get("ring_time", True)
     ar_tone = GOOD if ar >= s.answer_target_pct else (WARN if ar >= s.answer_target_pct - 10 else BAD)
     tiles = [
         ("Inbound calls", f"{k['inbound_total']:,}", f"{k['avg_inbound_per_open_day']:.0f} per working day", _hex(accent)),
         ("Answered in hours", f"{ar:.1f}%", f"target {s.answer_target_pct:.0f}%", ar_tone),
-        ("Truly missed", f"{k['true_missed']:,}", f"PBX log showed {k['pbx_reported_missed']:,}", BAD),
-        ("Saved by overflow", f"{k['answered_overflow']:,}",
+        ("Truly missed", f"{k['true_missed']:,}", f"PBX log showed {k['pbx_reported_missed']:,}", BAD)
+        if routing else ("Missed calls", f"{k['true_missed']:,}", f"{100 - k['answer_rate']:.1f}% of all inbound", BAD),
+        ("Engaged / busy", f"{k['busy']:,}", "callers got a busy tone", WARN if k["busy"] else GOOD)
+        if not routing else ("Saved by overflow", f"{k['answered_overflow']:,}",
          f"{100 * k['answered_overflow'] / max(1, k['answered']):.0f}% of answered calls", colors.HexColor(C_OVF)),
         ("Un-returned callers", f"{k['unreturned_callers']:,}", f"{k['unreturned_calls']:,} missed calls",
          BAD if k["unreturned_callers"] else GOOD),
-        ("Avg time to answer", fmt_dur(k["avg_ring_s"]), f"avg talk {fmt_dur(k['avg_talk_s'])}", _hex(accent)),
+        ("Avg time to answer", fmt_dur(k["avg_ring_s"]), f"avg talk {fmt_dur(k['avg_talk_s'])}", _hex(accent))
+        if ring else ("Avg call length", fmt_dur(k["avg_talk_s"]),
+                      "per answered call", _hex(accent)),
     ]
     gap = 2.6 * mm
     tw = (cw - gap * 5) / 6
@@ -324,18 +336,26 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     c.drawImage(chart_hourly(a, cw / mm, ch_h), M, y - ch_h * mm, cw, ch_h * mm)
     y -= ch_h * mm + 6 * mm
 
-    y = _section(c, "Missed calls - phone log vs reality", M, y, accent)
+    y = _section(c, "Missed calls - phone log vs reality" if routing else "Missed calls - how many were resolved",
+                 M, y, accent)
     _section(c, "What happened to missed callers", M + half + 6 * mm, y + 6.5 * mm, accent)
     ch2 = 48
     c.drawImage(chart_reality(a, half / mm, ch2), M, y - ch2 * mm, half, ch2 * mm)
     c.drawImage(chart_followup(a, half / mm, ch2), M + half + 6 * mm, y - ch2 * mm, half, ch2 * mm)
     y -= ch2 * mm + 3 * mm
 
-    note = (f"<b>How to read this:</b> the phone system writes a separate entry for every ring group, overflow group, "
-            f"menu and voicemail a call passes through, so one caller can appear as several 'not answered' rows. "
-            f"These have been stitched back into {k['inbound_total']:,} real calls. A call only counts as missed if no "
-            f"person answered it at any stage. Opening hours used: {s.open_time:%H:%M}-{s.close_time:%H:%M}. "
-            f"Callers who hung up within {s.short_abandon_s}s are excluded.")
+    if routing:
+        note = (f"<b>How to read this:</b> the phone system writes a separate entry for every ring group, overflow "
+                f"group, menu and voicemail a call passes through, so one caller can appear as several 'not answered' "
+                f"rows. These have been stitched back into {k['inbound_total']:,} real calls. A call only counts as "
+                f"missed if no person answered it at any stage. Opening hours used: "
+                f"{s.open_time:%H:%M}-{s.close_time:%H:%M}. Callers who hung up within {s.short_abandon_s}s are excluded.")
+    else:
+        note = (f"<b>How to read this:</b> this report is built from the line-level call log, which records one entry "
+                f"per call: answered, missed (rang with no answer) or engaged (busy tone). Calls between the business's "
+                f"own sites and call-forwarding legs have been removed. A missed call counts as followed up if the "
+                f"caller was later called back and connected, or rang again and was answered. Opening hours used: "
+                f"{s.open_time:%H:%M}-{s.close_time:%H:%M}.")
     _para(c, note, M, y, cw, _style(6.8, MUTED, leading=9.2))
     _footer(c, 1, brand, generated)
     c.showPage()
@@ -353,10 +373,10 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     right_w = cw - left_w - 5 * mm
     y0 = y
     _section(c, "Lines & branches", M, y0, accent)
-    rows = [["Line / branch", "Calls", "Ans %", "Missed", "O'flow", "Unret."]]
+    rows = [["Line / branch", "Calls", "Ans %", "Missed", "O'flow" if routing else "Busy", "Unret."]]
     for name, r in a.lines.head(12).iterrows():
         rows.append([_trunc(name, 34), f"{int(r.calls):,}", f"{r.answer_rate:.0f}%", f"{int(r.missed):,}",
-                     f"{int(r.overflow):,}", f"{int(r.unreturned_callers):,}"])
+                     f"{int(r.overflow if routing else r.busy):,}", f"{int(r.unreturned_callers):,}"])
     lw = [left_w * f for f in (0.44, 0.11, 0.11, 0.11, 0.11, 0.12)]
     h1 = _table(c, rows, M, y0 - 6.5 * mm, lw, NAVY)
 
