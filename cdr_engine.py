@@ -101,6 +101,7 @@ def load_cdr(raw: bytes) -> pd.DataFrame:
 PROVIDERS = {
     "bicom": "Bicom",
     "trusip": "TruSIP",
+    "grandstream": "Grandstream UCM",
 }
 
 # What each provider's export can tell us. TruSIP logs one row per call at trunk level,
@@ -108,17 +109,50 @@ PROVIDERS = {
 CAPS = {
     "bicom": {"routing": True, "ring_time": True},
     "trusip": {"routing": False, "ring_time": False},
+    "grandstream": {"routing": True, "ring_time": True},
 }
+
+
+def expand_archives(blobs: list[bytes]) -> list[bytes]:
+    """Unpack .tar / .zip / .gz uploads (Grandstream exports arrive as a tar of monthly CSVs)."""
+    import gzip
+    import tarfile
+    import zipfile
+
+    out: list[bytes] = []
+    for b in blobs:
+        if b[:2] == b"\x1f\x8b":
+            try:
+                out.extend(expand_archives([gzip.decompress(b)]))
+                continue
+            except OSError:
+                pass
+        if b[:4] == b"PK\x03\x04":
+            with zipfile.ZipFile(io.BytesIO(b)) as z:
+                inner = [z.read(n) for n in sorted(z.namelist()) if not n.endswith("/") and "__MACOSX" not in n]
+            out.extend(expand_archives(inner))
+            continue
+        if len(b) > 262 and b[257:262] == b"ustar":
+            with tarfile.open(fileobj=io.BytesIO(b)) as t:
+                inner = [t.extractfile(m).read() for m in sorted(t.getmembers(), key=lambda m: m.name) if m.isfile()]
+            out.extend(expand_archives(inner))
+            continue
+        out.append(b)
+    return out
 
 
 def detect_provider(raw: bytes) -> str | None:
     """Best guess at which PBX produced a file (used to warn about a wrong dropdown choice)."""
     try:
+        raw = expand_archives([raw])[0]
         head = _decode(raw[:4000]).splitlines()[0].lower()
     except Exception:  # noqa: BLE001
         return None
     if "dial status" in head and "called comments" in head:
         return "trusip"
+    if "callee number" in head and ("session" in head or "main_cdr" in head) or head.startswith('"main_cdr"') \
+            or head.startswith('"sub_cdr"'):
+        return "grandstream"
     if re.search(r"\d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2}", head) or "\t" in head:
         return "bicom"
     return None
@@ -235,7 +269,173 @@ def load_trusip(raw: bytes) -> pd.DataFrame:
     return df.sort_values("ts").reset_index(drop=True)
 
 
+GS_STATUS = {"ANSWERED": "Answered", "NO ANSWER": "Not Answered", "BUSY": "Busy", "FAILED": "Failed"}
+
+
+def load_grandstream(raw: bytes | list[bytes]) -> pd.DataFrame:
+    """Convert Grandstream UCM CDR export(s) into the shared leg format.
+
+    The UCM writes one `main_cdr` row per call plus `sub_cdr` rows for every leg. All rows of a call share a
+    `Session`. For each inbound call we emit: the DID leg, one leg per ring-group stage (answered by the
+    extension that picked up, or not answered), direct-to-extension legs and voicemail legs. That is the
+    same shape as the Bicom export, so overflow, ring time and voicemail are all analysed the same way.
+    """
+    blobs = raw if isinstance(raw, list) else [raw]
+    frames = []
+    for b in expand_archives(blobs):
+        t = pd.read_csv(io.StringIO(_decode(b)), dtype=str, keep_default_na=False)
+        t.columns = [c.strip() for c in t.columns]
+        need = ["CDR", "Caller Number", "Callee Number", "Start Time", "Call Status", "Call Type", "Session"]
+        missing = [c for c in need if c not in t.columns]
+        if missing:
+            raise ValueError(f"not a Grandstream CDR export - missing column(s): {', '.join(missing)}")
+        frames.append(t)
+    t = pd.concat(frames, ignore_index=True).drop_duplicates()
+    for c in ("Answer Time", "End Time", "Talk Time", "Call Time", "Action Type", "Last app.", "Caller Name",
+              "Caller ID", "Unique ID", "Dest Channel Extension", "Context"):
+        if c not in t:
+            t[c] = ""
+    t = t.apply(lambda c: c.str.strip())
+    t["ts"] = pd.to_datetime(t["Start Time"], errors="coerce")
+    t["ans_ts"] = pd.to_datetime(t["Answer Time"], errors="coerce")
+    t["end_ts"] = pd.to_datetime(t["End Time"], errors="coerce")
+    t["talk_n"] = pd.to_numeric(t["Talk Time"], errors="coerce").fillna(0).astype(int)
+    t = t.dropna(subset=["ts"]).reset_index(drop=True)
+    t["_ord"] = range(len(t))
+    is_ext = t["Caller Number"].str.fullmatch(r"\d{2,5}")
+
+    # extension -> person name, learned from calls the extension made
+    names = (t[is_ext & (t["Caller Name"] != "") & ~t["Caller Name"].str.fullmatch(r"\+?\d+")]
+             .groupby("Caller Number")["Caller Name"].agg(lambda s: s.value_counts().index[0]).to_dict())
+
+    def ext_name(x: str) -> str:
+        return f"{names.get(x, 'Ext ' + x)} ({x})"
+
+    mains = t[t["CDR"] == "main_cdr"]
+    subs = t[t["CDR"] != "main_cdr"]
+    sub_by_session = {k: g.sort_values(["ts", "_ord"]) for k, g in subs.groupby("Session")}
+
+    rows: list[dict] = []
+    did_groups: dict[str, list[str]] = {}
+    transfers = 0
+    for _, m in mains.iterrows():
+        ctype = m["Call Type"].lower()
+        session = m["Session"]
+        caller = m["Caller Number"]
+        if ctype == "outbound":
+            ext = caller
+            cli = re.search(r"<([^>]*)>", m["Caller ID"])
+            st_ = GS_STATUS.get(m["Call Status"].upper(), "Failed")
+            rows.append({"src": ext_name(ext), "dst": norm_number(m["Callee Number"]) or m["Callee Number"],
+                         "status": st_, "uid": m["Unique ID"] or session, "clid": f"<{cli.group(1) if cli else ''}>",
+                         "ts": m["ts"], "duration_s": int(pd.to_numeric(m["Call Time"], errors="coerce") or 0),
+                         "talk_s": m["talk_n"], "dst_label": "", "pbx_status": ""})
+            continue
+        if ctype != "inbound":
+            continue  # internal extension-to-extension calls
+        # A colleague transferring an answered call creates a new session keyed on their extension
+        if session.rsplit("-", 1)[-1] != caller and re.fullmatch(r"\d{2,5}", session.rsplit("-", 1)[-1] or ""):
+            transfers += 1
+            continue
+        legs = sub_by_session.get(session)
+        if legs is None or legs.empty:
+            legs = m.to_frame().T
+        start = m["ts"]
+        uid_sec = int(start.timestamp())
+        caller_disp = caller if re.fullmatch(r"\+?\d{5,}", caller) else (caller or "anonymous")
+        did = norm_number(m["Callee Number"]) if len(re.sub(r"\D", "", m["Callee Number"])) >= 8 else ""
+        if not did:
+            dl = legs[legs["Context"].str.startswith("ext-did")]
+            did = norm_number(dl["Callee Number"].iloc[0]) if len(dl) else ""
+        base = {"src": caller_disp, "clid": caller_disp}
+        n = 0
+
+        def add(dst, status, ts, dur, talk, label="", pbx=""):
+            nonlocal n
+            rows.append({**base, "dst": dst, "status": status, "uid": f"{uid_sec}.{len(rows) + 1}",
+                         "ts": ts, "duration_s": int(max(0, dur)), "talk_s": int(max(0, talk)), "dst_label": label,
+                         "pbx_status": pbx})
+            n += 1
+
+        # the line the call arrived on, carrying the UCM's own verdict on the call
+        add(did or "01", "Answered", start, 0, 0, pbx=GS_STATUS.get(m["Call Status"].upper(), "Failed"))
+        # group the legs into stages: each ring group, each direct extension dial, voicemail
+        stages: list[tuple[str, pd.DataFrame]] = []
+        for _, leg in legs.iterrows():
+            act = leg["Action Type"].upper()
+            app = leg["Last app."].lower()
+            if "voicemail" in app or act.startswith("VM"):
+                key = "VM"
+            elif act.startswith("RINGGROUP"):
+                key = act
+            elif act == "DIAL" and re.fullmatch(r"\d{2,5}", leg["Callee Number"]) and app == "dial":
+                key = f"EXT{leg['Callee Number']}"
+            else:
+                continue  # DID entry leg, IVR prompts, post-answer transfers etc.
+            if stages and stages[-1][0] == key:
+                stages[-1] = (key, pd.concat([stages[-1][1], leg.to_frame().T]))
+            else:
+                stages.append((key, leg.to_frame().T))
+        answered_yet = False
+        for key, g in stages:
+            g_start = g["ts"].min()
+            g_end = g["end_ts"].max() if g["end_ts"].notna().any() else g_start
+            if key == "VM":
+                add(f"VM-{g['Callee Number'].iloc[0]} ({g['Callee Number'].iloc[0]})", "Answered", g_start,
+                    (g_end - g_start).total_seconds(), int(g["talk_n"].max()))
+                continue
+            if answered_yet:
+                continue
+            pick = g[(g["Call Status"].str.upper() == "ANSWERED") & (g["talk_n"] > 0) &
+                     g["Callee Number"].str.fullmatch(r"\d{2,5}") & (g["Last app."].str.lower() == "dial")]
+            group_no = re.search(r"\[(\d+)\]", key)
+            gname = f"Ring group {group_no.group(1)}" if group_no else ext_name(key[3:])
+            if did and group_no:
+                did_groups.setdefault(did, []).append(gname)
+            if len(pick):
+                a = pick.sort_values("ans_ts").iloc[0]
+                ans = a["ans_ts"] if pd.notna(a["ans_ts"]) else g_start
+                ring = max(0.0, (ans - g_start).total_seconds())
+                add(ext_name(a["Callee Number"]), "Answered", g_start, ring + a["talk_n"], a["talk_n"])
+                answered_yet = True
+            else:
+                busy = (g["Call Status"].str.upper() == "BUSY").all()
+                num = group_no.group(1) if group_no else key[3:]
+                add(f"{gname} ({num})", "Busy" if busy else "Not Answered", g_start,
+                    (g_end - g_start).total_seconds(), 0)
+        if not stages:
+            # nothing rang: use the main record's own outcome
+            st_ = GS_STATUS.get(m["Call Status"].upper(), "Failed")
+            if st_ == "Answered" and m["talk_n"] > 0:
+                add("Reception (0)", "Answered", start, int(pd.to_numeric(m["Call Time"], errors="coerce") or 0),
+                    m["talk_n"])
+            else:
+                end = m["end_ts"] if pd.notna(m["end_ts"]) else start
+                add("Line (0)", "Busy" if st_ == "Busy" else "Not Answered", start, (end - start).total_seconds(), 0)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("no inbound or outbound calls found in the Grandstream file")
+    # label each DID with the ring group it usually lands on
+    labels = {d_: pd.Series(g).value_counts().index[0] for d_, g in did_groups.items()}
+    df.loc[df["dst"].isin(labels.keys()), "dst_label"] = df["dst"].map(labels)
+    df["start"] = df["ts"].dt.strftime("%d %b %Y %H:%M:%S")
+    for c in ("duration", "talk", "cost", "mos"):
+        df[c] = ""
+    df["mos_v"] = np.nan
+    df["cost_v"] = 0.0
+    df["provider"] = "grandstream"
+    df.attrs["dropped"] = {"transfers": transfers,
+                           "internal": int(((mains["Call Type"].str.lower() == "internal")).sum())}
+    return df.sort_values("ts").reset_index(drop=True)
+
+
 def load_many(files: list[bytes], provider: str = "bicom") -> pd.DataFrame:
+    if provider == "grandstream":
+        df = load_grandstream(list(files))
+        df["provider"] = provider
+        return df
+    files = expand_archives(list(files))
     loader = load_trusip if provider == "trusip" else load_cdr
     frames = [loader(f) for f in files]
     if len(frames) == 1:
@@ -613,6 +813,15 @@ def fmt_mins(m: float) -> str:
     return f"{m / 1440:.1f} days"
 
 
+def _pbx_missed(df: pd.DataFrame, lo, hi) -> int:
+    """How many inbound calls the phone system's own log calls unanswered in the period."""
+    win = df[(df["direction"] == "inbound") & (df["ts"] >= lo) & (df["ts"] < hi)]
+    if "pbx_status" in win and (win["pbx_status"].fillna("") != "").any():
+        # one verdict per call (Grandstream main_cdr)
+        return int(win["pbx_status"].isin(["Not Answered", "Busy"]).sum())
+    return int(win["status"].isin(["Not Answered", "Busy"]).sum())
+
+
 def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = None) -> Analysis:
     s = s or Settings()
     provider = str(raw_df["provider"].iloc[0]) if "provider" in raw_df and len(raw_df) else "bicom"
@@ -684,8 +893,7 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
         "true_missed_ooh": len(missed) - len(m_ih),
         "voicemail": int((missed["outcome"] == "Voicemail").sum()),
         "voicemail_direct": int(((missed["outcome"] == "Voicemail") & (missed["detail"] != "after ringing")).sum()),
-        "pbx_reported_missed": int((df[(df["direction"] == "inbound") & (df["ts"] >= lo) & (df["ts"] < hi)]["status"]
-                                    .isin(["Not Answered", "Busy"])).sum()),
+        "pbx_reported_missed": _pbx_missed(df, lo, hi),
         "short_abandons": int((inb["outcome"] == "Short abandon").sum()),
         "failed": int((inb["outcome"] == "Failed").sum()),
         "missed_judged": len(judged),
@@ -782,8 +990,10 @@ def _write_insights(a: Analysis) -> None:
     )
 
     if hidden > 0 and routing:
-        obs.append(f"{hidden:,} of the PBX's 'not answered' entries were not lost calls - they were answered by an "
-                   f"overflow group or are internal routing legs. The raw log overstates missed calls by "
+        why = ("answered by an overflow group, are internal routing legs, or were callers hanging up within "
+               f"{s.short_abandon_s}s")
+        obs.append(f"{hidden:,} of the phone system's 'not answered' entries were not genuine lost calls - they were "
+                   f"{why}. The raw log overstates missed calls by "
                    f"{100 * hidden / max(1, k['pbx_reported_missed']):.0f}%.")
     if k["answered"] and not routing:
         obs.append(f"Answered calls lasted {fmt_dur(k['avg_talk_s'])} on average.")
@@ -794,7 +1004,10 @@ def _write_insights(a: Analysis) -> None:
         if k["busy"] >= 10 or bp >= 15:
             rec.append("Reduce engaged tones: check the number of call channels, and enable call waiting or a "
                        "queue / overflow so busy-time callers are held or redirected instead of turned away.")
-    if k["answered"] and routing:
+    if k["answered"] and routing and not k["answered_overflow"]:
+        obs.append(f"Every answered call was picked up by the first ring group it reached, in "
+                   f"{fmt_dur(k['avg_ring_s'])} on average.")
+    if k["answered"] and routing and k["answered_overflow"]:
         ov = 100 * k["answered_overflow"] / k["answered"]
         obs.append(f"{ov:.0f}% of answered calls ({k['answered_overflow']:,}) were only picked up after the first ring "
                    f"group timed out. Average time to answer was {fmt_dur(k['avg_ring_s'])} overall versus "

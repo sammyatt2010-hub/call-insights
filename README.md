@@ -23,9 +23,40 @@ Upload a raw PBX call-record (CDR) export and get a true picture of call handlin
 Opening hours and days, answer-rate target, call-back target, "ignore hang-ups under X seconds",
 excluding nuisance or international numbers, and PDF branding (prepared-by name, accent colour, logo).
 
-## Input format
+## Phone systems supported
 
-Built around the PBX export with these columns (no header, tab-separated, UTF-16):
+Pick the phone system from the **Phone system** dropdown before uploading. If the file looks like the other
+provider's export the app warns you.
+
+| | Bicom | TruSIP | Grandstream UCM |
+|---|---|---|---|
+| Export | CDR, tab-separated, UTF-16, no header | Call log CSV with header | CDR CSV(s); the `.tar`/`.zip` download can be uploaded as-is (no file extension needed) |
+| Rows | One per *leg* | One per call, line level | `main_cdr` per call + `sub_cdr` per leg, grouped by `Session` |
+| Truly missed vs PBX log | Yes - legs stitched | Missed + engaged | Yes - compared with the UCM's own call status |
+| Overflow rescues | Yes | Not in the export | Yes (ring group -> ring group) |
+| Time to answer / quick hang-ups | Yes | Not in the export | Yes (from leg answer times) |
+| Who answered | Extension / queue | Not in the export | Named staff (names learnt from the extensions' own calls) |
+| Call-back tracking & un-returned callers | Yes | Yes | Yes |
+| Line names | Outbound caller ID / IVR detection | TruSIP "Called Comments" | The ring group each number rings (e.g. "Ring group 6402 · 01244 840083") |
+
+TruSIP-specific clean-up:
+- Calls between the business's own numbers (site to site) are removed.
+- Outbound rows that carry an outside caller's number within 15s of that caller's inbound call are
+  call-forwarding legs, not real outbound calls, so they're removed.
+- Outgoing lines are named by site, e.g. "Chester · 01244 313900".
+
+Grandstream-specific clean-up:
+- Internal (extension-to-extension) calls are ignored.
+- When a colleague transfers an answered call, the UCM starts a new session keyed on their extension; those are
+  merged into the original call rather than counted as new inbound calls.
+- A call the UCM marks "answered" with 0 seconds of talk (the caller hung up as it was picked up) counts as missed.
+
+To add another provider later, write a `load_<provider>()` in `cdr_engine.py` that returns the same columns
+as `load_trusip()`, then add it to `PROVIDERS` and `CAPS`.
+
+## Bicom input format
+
+Built around the Bicom export with these columns (no header, tab-separated, UTF-16):
 `From, To, Start, Duration, Talk time, Cost, Status, Unique ID, Caller ID, MOS`.
 Files with a header row, comma separators or UTF-8 also work. Several files can be uploaded together;
 overlapping rows are removed.
@@ -57,5 +88,6 @@ streamlit run app.py
 |---|---|
 | `app.py` | Streamlit interface |
 | `cdr_engine.py` | Parsing, call stitching, missed-call tracking, metrics, insights |
-| `report_pdf.py` | 2-page A4 PDF report |
+| `report_pdf.py` | 2-page A4 PDF report - "Portal" (dark, matches the web app) or "Print-friendly" (light) |
+| `fonts/` | Inter font files used by the PDF (SIL Open Font Licence - see `fonts/LICENSE-Inter.txt`) |
 | `.streamlit/config.toml` | Dark theme |

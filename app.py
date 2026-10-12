@@ -159,8 +159,8 @@ def run_analysis(df: pd.DataFrame, start, end, settings_tuple):
 
 
 @st.cache_data(show_spinner=False)
-def make_pdf(_a, key, customer, brand, accent, logo):
-    return build_pdf(_a, customer, brand, accent, logo)
+def make_pdf(_a, key, customer, brand, accent, logo, style):
+    return build_pdf(_a, customer, brand, accent, logo, style)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +189,9 @@ with st.sidebar:
                                 help="e.g. known spam, test calls, or the customer's own mobiles.")
     st.markdown("**Report branding**")
     brand = st.text_input("Prepared by", "SY Communications")
-    accent = st.color_picker("Accent colour", "#4F46E5")
+    pdf_style = st.radio("PDF style", ["Portal (dark)", "Print-friendly (light)"], horizontal=False,
+                         help="Portal matches this web app. Print-friendly is the same layout on white paper.")
+    accent = st.color_picker("Accent colour", "#7C83FF")
     logo_file = st.file_uploader("Logo for PDF (optional)", type=["png", "jpg", "jpeg"])
 
 settings_tuple = (
@@ -215,10 +217,12 @@ with st.container(key="card-upload"):
     pc2.caption({
         "bicom": "Bicom CDR export (tab-separated). Shows every ring group, overflow and voicemail step, so overflow "
                  "rescues and time-to-answer are reported.",
+        "grandstream": "Grandstream UCM CDR export (CSV, or the .tar / .zip download as-is). Shows every ring group, "
+                       "extension and voicemail step, so who answered, overflow and time-to-answer are reported.",
         "trusip": "TruSIP call log (CSV). One row per call at line level: answered / missed / engaged and call-backs "
                   "are reported; ring groups, overflow and time-to-answer are not in this export.",
     }[provider])
-    files = st.file_uploader("CDR file(s)", type=["csv", "txt", "tsv"], accept_multiple_files=True,
+    files = st.file_uploader("CDR file(s)", type=None, accept_multiple_files=True,
                              label_visibility="collapsed")
     if files:
         try:
@@ -233,11 +237,13 @@ with st.container(key="card-upload"):
             dropped = df.attrs.get("dropped", {})
             extra = ""
             if dropped.get("internal"):
-                extra += chip(f"{dropped['internal']} internal site-to-site calls ignored")
+                extra += chip(f"{dropped['internal']} internal calls ignored")
+            if dropped.get("transfers"):
+                extra += chip(f"{dropped['transfers']} colleague transfers merged")
             if dropped.get("forwarded_legs"):
                 extra += chip(f"{dropped['forwarded_legs']} forwarding legs merged")
             render_html(chip(ce.PROVIDERS[provider], "accent")
-                        + chip(f"{len(df):,} {'call legs' if provider == 'bicom' else 'call records'}", "accent") + chip(f"{dmin:%d %b %Y} → {dmax:%d %b %Y}")
+                        + chip(f"{len(df):,} {'call records' if provider == 'trusip' else 'call legs'}", "accent") + chip(f"{dmin:%d %b %Y} → {dmax:%d %b %Y}")
                         + chip(f"{(dmax - dmin).days + 1} days of data") + chip(f"{len(files)} file(s)", "good") + extra)
             stage = 2
         except Exception as e:  # noqa: BLE001
@@ -415,9 +421,20 @@ elif a is not None:
                 "Answer %", min_value=0, max_value=100, format="%.0f%%")})
             st.markdown('<div class="pe-h">Team - outbound & call-backs</div>', unsafe_allow_html=True)
             tv = a.team.reset_index().rename(columns={
-                "agent": "Extension" if routing else "Outgoing line", "outbound": "Outbound calls", "connected": "Connected",
+                "agent": "Person / extension" if routing else "Outgoing line", "outbound": "Outbound calls", "connected": "Connected",
                 "talk_s": "Talk time", "missed_calls_returned": "Missed calls returned"})
             tv["Talk time"] = tv["Talk time"].map(ce.fmt_dur)
+            ans = a.inbound[a.inbound["outcome"].isin(["Answered", "Answered via overflow"])]
+            ans_by = ans[ans["answered_by"] != ""].groupby("answered_by").size()
+            if len(ans_by):
+                first = tv.columns[0]
+                tv = tv.merge(ans_by.rename("Inbound answered").reset_index().rename(columns={"answered_by": first}),
+                              on=first, how="outer").fillna(0)
+                for col in ("Outbound calls", "Connected", "Missed calls returned", "Inbound answered"):
+                    tv[col] = tv[col].astype(int)
+                tv["Talk time"] = tv["Talk time"].replace(0, "-")
+                tv = tv[[first, "Inbound answered", "Outbound calls", "Connected", "Talk time", "Missed calls returned"]]
+                tv = tv.sort_values(["Inbound answered", "Outbound calls"], ascending=False)
             show_df(tv)
 
         with tabs[4]:
@@ -439,9 +456,11 @@ elif a is not None:
         section_header("04", "Download the report", "2-page A4 PDF: executive summary, charts, call-back list, "
                                                      "observations and recommendations")
         logo = logo_file.getvalue() if logo_file else None
-        pdf_key = (p_start, p_end, settings_tuple, customer, brand, accent, len(logo or b""))
+        data_id = (a.provider, len(a.inbound), len(a.outbound), str(a.inbound["call_id"].head(20).tolist()))
+        pdf_key = (data_id, p_start, p_end, settings_tuple, customer, brand, accent, len(logo or b""))
         with st.spinner("Building PDF..."):
-            pdf = make_pdf(a, pdf_key, customer, brand, accent, logo)
+            style = "print" if pdf_style.startswith("Print") else "portal"
+            pdf = make_pdf(a, pdf_key + (style,), customer, brand, accent, logo, style)
         fname = f"Call_Assessment_{(customer or 'Customer').replace(' ', '_')}_{p_start:%Y%m%d}-{p_end:%Y%m%d}.pdf"
         c1, c2 = st.columns([1, 2])
         c1.download_button("Download PDF report", pdf, fname, "application/pdf", type="primary", **FULL_WIDTH)
