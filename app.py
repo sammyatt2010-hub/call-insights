@@ -148,8 +148,8 @@ ICON_UPLOAD = ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stro
 
 
 @st.cache_data(show_spinner=False)
-def load_files(blobs: tuple[bytes, ...]) -> pd.DataFrame:
-    return ce.load_many(list(blobs))
+def load_files(blobs: tuple[bytes, ...], provider: str) -> pd.DataFrame:
+    return ce.load_many(list(blobs), provider)
 
 
 @st.cache_data(show_spinner=False)
@@ -181,7 +181,8 @@ with st.sidebar:
     cb_target = st.select_slider("Call-back target", options=[15, 30, 60, 120, 240, 480], value=60,
                                  format_func=lambda m: f"{m} min" if m < 60 else f"{m // 60} hr")
     short_ab = st.number_input("Ignore hang-ups under (seconds)", 0, 30, 5,
-                               help="Callers who hang up this quickly never gave you a fair chance to answer.")
+                               help="Callers who hang up this quickly never gave you a fair chance to answer. "
+                                    "(Bicom only - TruSIP logs don't record ring time.)")
     with st.expander("Exclude callers"):
         excl_int = st.checkbox("Exclude international numbers", value=False)
         excl_txt = st.text_area("Numbers to exclude (one per line)", placeholder="07700 900123",
@@ -207,19 +208,41 @@ stage = 1
 # --------------------------------------------------------------------------- #
 df = None
 with st.container(key="card-upload"):
-    section_header("01", "Upload call records", "Raw CDR export from the PBX - CSV or tab-separated, any date range")
+    section_header("01", "Upload call records", "Pick the phone system, then drop in its call-log export - any date range")
+    pc1, pc2 = st.columns([1, 2.2])
+    provider = pc1.selectbox("Phone system", list(ce.PROVIDERS), format_func=ce.PROVIDERS.get,
+                             help="Each phone system exports call records differently.")
+    pc2.caption({
+        "bicom": "Bicom CDR export (tab-separated). Shows every ring group, overflow and voicemail step, so overflow "
+                 "rescues and time-to-answer are reported.",
+        "trusip": "TruSIP call log (CSV). One row per call at line level: answered / missed / engaged and call-backs "
+                  "are reported; ring groups, overflow and time-to-answer are not in this export.",
+    }[provider])
     files = st.file_uploader("CDR file(s)", type=["csv", "txt", "tsv"], accept_multiple_files=True,
                              label_visibility="collapsed")
     if files:
         try:
+            blobs = tuple(f.getvalue() for f in files)
+            guess = ce.detect_provider(blobs[0])
+            if guess and guess != provider:
+                st.warning(f"This file looks like a **{ce.PROVIDERS[guess]}** export, but **{ce.PROVIDERS[provider]}** "
+                           f"is selected. Switch the phone system above if the results look wrong.")
             with st.spinner("Reading call records..."):
-                df = load_files(tuple(f.getvalue() for f in files))
+                df = load_files(blobs, provider)
             dmin, dmax = ce.detect_range(df)
-            render_html(chip(f"{len(df):,} call legs", "accent") + chip(f"{dmin:%d %b %Y} → {dmax:%d %b %Y}")
-                        + chip(f"{(dmax - dmin).days + 1} days of data") + chip(f"{len(files)} file(s)", "good"))
+            dropped = df.attrs.get("dropped", {})
+            extra = ""
+            if dropped.get("internal"):
+                extra += chip(f"{dropped['internal']} internal site-to-site calls ignored")
+            if dropped.get("forwarded_legs"):
+                extra += chip(f"{dropped['forwarded_legs']} forwarding legs merged")
+            render_html(chip(ce.PROVIDERS[provider], "accent")
+                        + chip(f"{len(df):,} {'call legs' if provider == 'bicom' else 'call records'}", "accent") + chip(f"{dmin:%d %b %Y} → {dmax:%d %b %Y}")
+                        + chip(f"{(dmax - dmin).days + 1} days of data") + chip(f"{len(files)} file(s)", "good") + extra)
             stage = 2
         except Exception as e:  # noqa: BLE001
-            st.error(f"Couldn't read that file - is it the raw CDR export? ({e})")
+            st.error(f"Couldn't read that file as a {ce.PROVIDERS[provider]} export - check the phone system "
+                     f"selected above. ({e})")
     else:
         render_html(f'<div class="pe-empty"><div class="ic">{ICON_UPLOAD}</div><div>'
                     f'<div class="t">Drop in a CDR export to get started</div><ol>'
@@ -273,15 +296,22 @@ elif a is not None:
         section_header("03", "Call handling at a glance", f"{a.period_start:%d %b %Y} → {a.period_end:%d %b %Y}")
         ar = k["answer_rate_ih"]
         tone = "good" if ar >= s.answer_target_pct else ("warn" if ar >= s.answer_target_pct - 10 else "bad")
+        routing, ring = a.caps["routing"], a.caps["ring_time"]
         tiles = [
             ("Inbound calls", f"{k['inbound_total']:,}", f"{k['avg_inbound_per_open_day']:.0f} per working day", ""),
             ("Answered in hours", f"{ar:.1f}%", f"target {s.answer_target_pct:.0f}%", tone),
-            ("Truly missed", f"{k['true_missed']:,}", f"PBX log said {k['pbx_reported_missed']:,}", "bad"),
+            ("Truly missed", f"{k['true_missed']:,}", f"PBX log said {k['pbx_reported_missed']:,}", "bad")
+            if routing else ("Missed calls", f"{k['true_missed']:,}",
+                             f"{100 - k['answer_rate']:.1f}% of all inbound", "bad"),
             ("Saved by overflow", f"{k['answered_overflow']:,}",
-             f"{100 * k['answered_overflow'] / max(1, k['answered']):.0f}% of answered", "cyan"),
+             f"{100 * k['answered_overflow'] / max(1, k['answered']):.0f}% of answered", "cyan")
+            if routing else ("Engaged / busy", f"{k['busy']:,}", "callers who got a busy tone",
+                             "warn" if k["busy"] else "good"),
             ("Un-returned callers", f"{k['unreturned_callers']:,}", f"{k['unreturned_calls']:,} missed calls",
              "bad" if k["unreturned_callers"] else "good"),
-            ("Avg time to answer", ce.fmt_dur(k["avg_ring_s"]), f"median call-back {ce.fmt_mins(k['median_callback_min'])}", ""),
+            ("Avg time to answer", ce.fmt_dur(k["avg_ring_s"]), f"median call-back {ce.fmt_mins(k['median_callback_min'])}", "")
+                if ring else ("Avg call length", ce.fmt_dur(k["avg_talk_s"]),
+                          f"median call-back {ce.fmt_mins(k['median_callback_min'])}", ""),
         ]
         render_html('<div class="pe-kpis">' + "".join(
             f'<div class="pe-kpi {t}"><div class="l">{esc(l)}</div><div class="v">{esc(v)}</div>'
@@ -303,7 +333,7 @@ elif a is not None:
                               ("Missed", "#F87171"), ("Busy", "#FB923C"), ("Voicemail", "#FBBF24")]:
                 if col in hrs:
                     fig.add_bar(x=[f"{h:02d}:00" for h in hrs.index], y=(hrs[col] / k["days"]).round(2),
-                                name=col, marker_color=colr)
+                                name="Engaged (busy)" if col == "Busy" else col, marker_color=colr)
             plot_layout(fig).update_layout(title=dict(text="Average calls per day by hour", font=dict(size=14)))
             c1, c2 = st.columns([1.5, 1])
             with c1:
@@ -330,9 +360,11 @@ elif a is not None:
 
         with tabs[1]:
             m = a.missed.copy()
-            render_html(chip(f"{len(m):,} truly missed", "bad") + chip(f"{k['voicemail']:,} to voicemail", "warn")
+            render_html(chip(f"{len(m):,} {'truly ' if routing else ''}missed", "bad")
+                        + (chip(f"{k['voicemail']:,} to voicemail", "warn") if routing else "")
+                        + (chip(f"{k['busy']:,} engaged", "warn") if k["busy"] else "")
                         + chip(f"{k['missed_resolved']:,} resolved", "good")
-                        + chip(f"{k['short_abandons']:,} quick hang-ups excluded"))
+                        + (chip(f"{k['short_abandons']:,} quick hang-ups excluded") if ring else ""))
             opts = sorted(m["follow_up"].unique().tolist())
             pick = st.multiselect("Show follow-up status", opts, default=opts)
             m = m[m["follow_up"].isin(pick)]
@@ -348,6 +380,9 @@ elif a is not None:
                 "By": m["follow_up_by"],
                 "Route through PBX": m["route"],
             }).iloc[::-1]
+            if not routing:
+                view = view.drop(columns=["Route through PBX"])
+                view["Outcome"] = view["Outcome"].replace({"Busy": "Engaged (busy)"})
             show_df(view, height=440)
             st.download_button("Download missed calls (CSV)", view.to_csv(index=False).encode(),
                                "missed_calls.csv", "text/csv")
@@ -372,13 +407,15 @@ elif a is not None:
             st.markdown('<div class="pe-h">Lines & branches</div>', unsafe_allow_html=True)
             lv = a.lines.reset_index().rename(columns={
                 "line_name": "Line / branch", "calls": "Calls", "answered": "Answered", "overflow": "Via overflow",
+                "busy": "Engaged",
                 "missed": "Missed", "answer_rate": "Answer %", "unreturned_callers": "Un-returned callers"})
+            lv = lv.drop(columns=["Engaged"] if routing else ["Via overflow"])
             lv["Answer %"] = lv["Answer %"].round(1)
             show_df(lv, column_config={"Answer %": st.column_config.ProgressColumn(
                 "Answer %", min_value=0, max_value=100, format="%.0f%%")})
             st.markdown('<div class="pe-h">Team - outbound & call-backs</div>', unsafe_allow_html=True)
             tv = a.team.reset_index().rename(columns={
-                "agent": "Extension", "outbound": "Outbound calls", "connected": "Connected",
+                "agent": "Extension" if routing else "Outgoing line", "outbound": "Outbound calls", "connected": "Connected",
                 "talk_s": "Talk time", "missed_calls_returned": "Missed calls returned"})
             tv["Talk time"] = tv["Talk time"].map(ce.fmt_dur)
             show_df(tv)
@@ -421,6 +458,6 @@ step_html = '<span class="pe-step-sep"></span>'.join(
     for i, s_ in enumerate(steps))
 render_html(f'<div class="pe-hero"><div><div class="pe-eyebrow"><span class="dot"></span>CDR analysis</div>'
             f'<div class="pe-title">Call handling <span>assessment</span></div>'
-            f'<div class="pe-sub">See what really happened to every call: missed calls the overflow group rescued, '
-            f'calls that were genuinely lost, and the customers nobody called back.</div></div>'
+            f'<div class="pe-sub">See what really happened to every call: which calls were genuinely lost, how '
+            f'quickly they were returned, and the customers nobody called back.</div></div>'
             f'<div class="pe-stepper">{step_html}</div></div>', hero)
