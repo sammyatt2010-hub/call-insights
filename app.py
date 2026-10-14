@@ -68,6 +68,8 @@ with st.container(key="card-upload"):
     pc2.caption({
         "bicom": "Bicom CDR export (tab-separated). Shows every ring group, overflow and voicemail step, so overflow "
                  "rescues and time-to-answer are reported.",
+        "vela": "Vela Networks call log (CSV). One row per call with the IVR, ring groups (incl. overflow), routing "
+                "and talk time - menu hang-ups, overflow rescues and time-to-answer are reported.",
         "grandstream": "Grandstream UCM CDR export (CSV, or the .tar / .zip download as-is). Shows every ring group, "
                        "extension and voicemail step, so who answered, overflow and time-to-answer are reported.",
         "trusip": "TruSIP call log (CSV). One row per call at line level: answered / missed / engaged and call-backs "

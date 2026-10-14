@@ -23,7 +23,7 @@ Upload a raw PBX call-record (CDR) export and get a true picture of call handlin
 A **User assessment** tab and a separate multi-page **User assessment PDF** (team overview, ring groups, then a
 card per person with stats, observations and a calls-by-hour chart).
 
-| Measure | Grandstream | Bicom | TruSIP |
+| Measure | Grandstream | Bicom / Vela | TruSIP |
 |---|---|---|---|
 | Inbound calls that rang each person, pick-up rate, calls lost while ringing | Yes | - | - |
 | Inbound answered, share of team, time to answer, talk time | Yes | Yes | - |
@@ -46,16 +46,16 @@ excluding nuisance or international numbers, and PDF branding (prepared-by name,
 Pick the phone system from the **Phone system** dropdown before uploading. If the file looks like the other
 provider's export the app warns you.
 
-| | Bicom | TruSIP | Grandstream UCM |
-|---|---|---|---|
-| Export | CDR, tab-separated, UTF-16, no header | Call log CSV with header | CDR CSV(s); the `.tar`/`.zip` download can be uploaded as-is (no file extension needed) |
-| Rows | One per *leg* | One per call, line level | `main_cdr` per call + `sub_cdr` per leg, grouped by `Session` |
-| Truly missed vs PBX log | Yes - legs stitched | Missed + engaged | Yes - compared with the UCM's own call status |
-| Overflow rescues | Yes | Not in the export | Yes (ring group -> ring group) |
-| Time to answer / quick hang-ups | Yes | Not in the export | Yes (from leg answer times) |
-| Who answered | Extension / queue | Not in the export | Named staff (names learnt from the extensions' own calls) |
-| Call-back tracking & un-returned callers | Yes | Yes | Yes |
-| Line names | Outbound caller ID / IVR detection | TruSIP "Called Comments" | The ring group each number rings (e.g. "Ring group 6402 · 01244 840083") |
+| | Bicom | TruSIP | Grandstream UCM | Vela Networks |
+|---|---|---|---|---|
+| Export | CDR, tab-separated, UTF-16, no header | Call log CSV with header | CDR CSV(s); the `.tar`/`.zip` download can be uploaded as-is (no file extension needed) | Call log CSV (`IPPBXCE-Cdr-…csv`) |
+| Rows | One per *leg* | One per call, line level | `main_cdr` per call + `sub_cdr` per leg, grouped by `Session` | One per call, listing IVR, ring groups and queue |
+| Truly missed vs PBX log | Yes - legs stitched | Missed + engaged | Yes - compared with the UCM's own call status | Yes - incl. callers who hung up in the IVR menu (logged by the PBX as answered) |
+| Overflow rescues | Yes | Not in the export | Yes (ring group -> ring group) | Yes (e.g. Tyres Ring Group -> Tyres Overflow) |
+| Time to answer / quick hang-ups | Yes | Not in the export | Yes (from leg answer times) | Yes (routing duration, incl. menu time) |
+| Who answered | Extension / queue | Not in the export | Named staff (names learnt from the extensions' own calls) | Ring group (not the person) |
+| Call-back tracking & un-returned callers | Yes | Yes | Yes | Yes |
+| Line names | Outbound caller ID / IVR detection | TruSIP "Called Comments" | The ring group each number rings (e.g. "Ring group 6402 · 01244 840083") | The ring group / IVR / voicemail the call reached |
 
 TruSIP-specific clean-up:
 - Calls between the business's own numbers (site to site) are removed.
@@ -68,6 +68,11 @@ Grandstream-specific clean-up:
 - When a colleague transfers an answered call, the UCM starts a new session keyed on their extension; those are
   merged into the original call rather than counted as new inbound calls.
 - A call the UCM marks "answered" with 0 seconds of talk (the caller hung up as it was picked up) counts as missed.
+
+Vela-specific handling:
+- Internal calls are ignored; outbound calls are credited to the extension that made them (e.g. "Office 1000").
+- A call the PBX marks ANSWERED that never left the IVR (no ring group, 0s talk) is a **menu hang-up** and counts
+  as missed (unless shorter than the "ignore hang-ups" setting); it gets its own observation and recommendation.
 
 To add another provider later, write a `load_<provider>()` in `cdr_engine.py` that returns the same columns
 as `load_trusip()`, then add it to `PROVIDERS` and `CAPS`.

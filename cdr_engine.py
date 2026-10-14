@@ -102,6 +102,7 @@ PROVIDERS = {
     "bicom": "Bicom",
     "trusip": "TruSIP",
     "grandstream": "Grandstream UCM",
+    "vela": "Vela Networks",
 }
 
 # What each provider's export can tell us. TruSIP logs one row per call at trunk level,
@@ -110,6 +111,7 @@ CAPS = {
     "bicom": {"routing": True, "ring_time": True},
     "trusip": {"routing": False, "ring_time": False},
     "grandstream": {"routing": True, "ring_time": True},
+    "vela": {"routing": True, "ring_time": True},
 }
 
 
@@ -150,6 +152,8 @@ def detect_provider(raw: bytes) -> str | None:
         return None
     if "dial status" in head and "called comments" in head:
         return "trusip"
+    if "communication type" in head and "routing duration" in head:
+        return "vela"
     if "callee number" in head and ("session" in head or "main_cdr" in head) or head.startswith('"main_cdr"') \
             or head.startswith('"sub_cdr"'):
         return "grandstream"
@@ -477,7 +481,126 @@ def grandstream_from_table(t: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("ts").reset_index(drop=True)
 
 
+def _vela_name(v: str) -> tuple[str, str]:
+    """'Tyres Ring Group<6300>' -> ('Tyres Ring Group', '6300'); '+447...' -> ('+447...', '')."""
+    m = re.match(r"^\s*(.*?)\s*<([^>]*)>\s*$", str(v))
+    return (m.group(1).strip(), m.group(2).strip()) if m else (str(v).strip(), "")
+
+
+def load_vela(raw: bytes | list[bytes]) -> pd.DataFrame:
+    """Vela Networks call log: one row per call, with the IVR, every ring group / queue the call passed through
+    (overflow included), routing time (ringing + menu) and handling time (talk). Converted to the shared leg format:
+    one leg per ring group (the last one answers), voicemail legs, and an IVR leg for callers who hung up in the menu.
+    """
+    blobs = raw if isinstance(raw, list) else [raw]
+    frames = []
+    for b in expand_archives(blobs):
+        t = pd.read_csv(io.StringIO(_decode(b)), dtype=str, keep_default_na=False)
+        t.columns = [c.strip() for c in t.columns]
+        need = ["ID", "Time", "Communication Type", "Call From", "Call To", "Last Status"]
+        missing = [c for c in need if c not in t.columns]
+        if missing:
+            raise ValueError(f"not a Vela Networks call log - missing column(s): {', '.join(missing)}")
+        frames.append(t)
+    t = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ID"])
+    for c in ("Queue", "Ring Group", "Ivr", "Call Duration", "Routing Duration", "Handling Duration"):
+        if c not in t:
+            t[c] = ""
+    t = t.apply(lambda c: c.str.strip())
+    t["ts"] = pd.to_datetime(t["Time"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    if t["ts"].isna().mean() > 0.5:
+        t["ts"] = pd.to_datetime(t["Time"], dayfirst=True, errors="coerce")
+    t = t.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    num = lambda c: pd.to_numeric(t[c], errors="coerce").fillna(0).astype(int)  # noqa: E731
+    t["dur"], t["route"], t["talk"] = num("Call Duration"), num("Routing Duration"), num("Handling Duration")
+    status_map = {"ANSWERED": "Answered", "ABANDONED": "Not Answered", "NO ANSWER": "Not Answered",
+                  "BUSY": "Busy", "FAILED": "Failed", "VOICEMAIL": "Answered"}
+
+    rows: list[dict] = []
+    internal = 0
+    for i, r in t.iterrows():
+        ctype = r["Communication Type"].lower()
+        uid_sec = int(r["ts"].timestamp())
+        status = r["Last Status"].upper()
+        if ctype == "internal":
+            internal += 1
+            continue
+        if ctype == "outbound":
+            name, ext = _vela_name(r["Call From"])
+            rows.append({"src": f"{name} ({ext or '0'})", "dst": norm_number(r["Call To"]) or r["Call To"],
+                         "status": status_map.get(status, "Failed"), "uid": f"{uid_sec}.{len(rows) + 1}",
+                         "clid": "", "ts": r["ts"], "duration_s": int(r["dur"]), "talk_s": int(r["talk"]),
+                         "dst_label": "", "pbx_status": ""})
+            continue
+        if ctype != "inbound":
+            continue
+        caller_name, caller_num = _vela_name(r["Call From"])
+        caller = caller_num if caller_num and caller_num.lower() != "anonymous" else caller_name
+        caller = "anonymous" if caller.lower() == "anonymous" else caller
+        pbx = "Answered" if status in ("ANSWERED", "VOICEMAIL") else status_map.get(status, "Failed")
+        base = {"src": caller, "clid": caller, "dst_label": "", "pbx_status": ""}
+
+        def add(dst, st_, dur, talk, pbx_status=""):
+            rows.append({**base, "dst": dst, "status": st_, "uid": f"{uid_sec}.{len(rows) + 1}", "ts": r["ts"],
+                         "duration_s": int(max(0, dur)), "talk_s": int(max(0, talk)), "pbx_status": pbx_status})
+
+        stages = []
+        for part in [p for p in re.split(r",(?![^<]*>)", r["Ring Group"]) if p.strip()]:
+            n, x = _vela_name(part)
+            stages.append(f"{n} ({x or '0'})")
+        for part in [p for p in re.split(r",(?![^<]*>)", r["Queue"]) if p.strip()]:
+            n, x = _vela_name(part)
+            stages.append(f"Queue {n if n != x else x} ({x or '0'})")
+        dedup = []
+        for s_ in stages:  # 'A,B,A' (overflow then back) keeps its order but not immediate repeats
+            if not dedup or dedup[-1] != s_:
+                dedup.append(s_)
+        to_name, to_ext = _vela_name(r["Call To"])
+        first_pbx = pbx
+        if status == "VOICEMAIL":
+            for s_ in dedup:
+                add(s_, "Not Answered", r["route"], 0, first_pbx)
+                first_pbx = ""
+            vm = to_name.replace("Voicemail", "").strip() or "Voicemail"
+            add(f"VM {vm} ({to_ext or '0'})", "Answered", r["dur"], r["talk"], first_pbx)
+        elif dedup:
+            answered = status == "ANSWERED" and r["talk"] > 0
+            for j, s_ in enumerate(dedup):
+                last = j == len(dedup) - 1
+                if answered and last:
+                    add(s_, "Answered", r["route"] + r["talk"], r["talk"], first_pbx)
+                else:
+                    add(s_, "Not Answered", r["route"] if last else 0, 0, first_pbx)
+                first_pbx = ""
+        else:
+            # never reached a ring group: answered by a person directly, or hung up in the IVR menu
+            label = f"{to_name} ({to_ext or '0'})"  # e.g. "IVR Main IVR (6200)" - shown as "Main IVR"
+            if to_name.upper().startswith("IVR") and r["talk"] == 0:
+                add(label, "Not Answered", r["route"], 0, first_pbx)
+            elif status == "ANSWERED" and r["talk"] > 0:
+                add(label, "Answered", r["route"] + r["talk"], r["talk"], first_pbx)
+            else:
+                add(label, status_map.get(status, "Failed") if status != "ANSWERED" else "Not Answered",
+                    r["route"], 0, first_pbx)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("no inbound or outbound calls found in the Vela Networks file")
+    df["start"] = df["ts"].dt.strftime("%d %b %Y %H:%M:%S")
+    for c in ("duration", "talk", "cost", "mos"):
+        df[c] = ""
+    df["mos_v"] = np.nan
+    df["cost_v"] = 0.0
+    df["provider"] = "vela"
+    df.attrs["dropped"] = {"internal": internal}
+    return df.sort_values(["ts", "uid"]).reset_index(drop=True)
+
+
 def load_many(files: list[bytes], provider: str = "bicom") -> pd.DataFrame:
+    if provider == "vela":
+        df = load_vela(list(files))
+        df["provider"] = provider
+        return df
     if provider == "grandstream":
         df = load_grandstream(list(files))
         df["provider"] = provider
@@ -714,10 +837,11 @@ def build_inbound_calls(df: pd.DataFrame) -> pd.DataFrame:
                 outcome = "Failed"
             elif "Busy" in statuses and "Not Answered" not in statuses:
                 outcome = "Busy"
-            elif wait_total < 0:
-                outcome = "Missed"
             else:
                 outcome = "Missed"
+                if non_vm and all(re.search(r"\bivr\b", str(l["dst"]), re.I) for l in non_vm
+                                  if l["dst_kind"] != "NUM"):
+                    detail = "hung up in the menu"
 
         line_leg = next((l for l in legs if l["dst_kind"] == "NUM"), first)
         rows.append({
@@ -900,8 +1024,17 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
 
     inb["in_hours"] = in_hours(inb["ts"], s) if len(inb) else []
     missed["in_hours"] = in_hours(missed["ts"], s) if len(missed) else []
-    inb["line_name"] = inb["line"].map(lambda n: labels.get(n, pretty_number(n) if str(n).startswith("0") else f"{n} (direct)"))
-    missed["line_name"] = missed["line"].map(lambda n: labels.get(n, pretty_number(n) if str(n).startswith("0") else f"{n} (direct)"))
+    def _line_name(n):
+        if n in labels:
+            return labels[n]
+        if str(n).startswith("0"):
+            return pretty_number(n)
+        if provider == "vela":  # Vela calls are named after the ring group / IVR / voicemail they reached
+            return re.sub(r"^(VM|IVR|Voicemail)\s+", "", str(n))
+        return f"{n} (direct)"
+
+    inb["line_name"] = inb["line"].map(_line_name)
+    missed["line_name"] = missed["line"].map(_line_name)
 
     counted = inb[~inb["outcome"].isin(["Short abandon", "Failed"])]
     counted_ih = counted[counted["in_hours"]]
@@ -939,6 +1072,7 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
         "true_missed_ih": len(m_ih),
         "true_missed_ooh": len(missed) - len(m_ih),
         "voicemail": int((missed["outcome"] == "Voicemail").sum()),
+        "menu_hangups": int((missed["detail"] == "hung up in the menu").sum()),
         "voicemail_direct": int(((missed["outcome"] == "Voicemail") & (missed["detail"] != "after ringing")).sum()),
         "pbx_reported_missed": _pbx_missed(df, lo, hi),
         "short_abandons": int((inb["outcome"] == "Short abandon").sum()),
@@ -1019,10 +1153,15 @@ def _write_insights(a: Analysis) -> None:
     ar = k["answer_rate_ih"]
     hidden = max(0, k["pbx_reported_missed"] - k["true_missed"])
     routing = a.caps.get("routing", True)
-    if routing:
+    if routing and k["true_missed"] <= k["pbx_reported_missed"]:
         middle = (f"The phone system's own log shows {k['pbx_reported_missed']:,} 'not answered' entries, but once "
                   f"ring-group overflow and call routing are stitched together only {k['true_missed']:,} calls were "
                   f"truly missed. ")
+    elif routing:
+        extra = (f", including {k['menu_hangups']:,} who hung up in the phone menu - the phone system logs those as "
+                 f"answered" if k.get("menu_hangups") else "")
+        middle = (f"The phone system's own log shows {k['pbx_reported_missed']:,} unanswered calls, but following each "
+                  f"call to where it actually ended, {k['true_missed']:,} callers never reached a person{extra}. ")
     else:
         middle = (f"{k['true_missed']:,} calls were missed"
                   + (f", including {k['busy']:,} callers who heard an engaged tone" if k["busy"] else "") + ". ")
@@ -1087,8 +1226,14 @@ def _write_insights(a: Analysis) -> None:
                        "callers speak to a person and a message is captured.")
 
     if k["voicemail"]:
-        obs.append(f"{k['voicemail']:,} callers ended in voicemail - {k['voicemail_direct']:,} went straight there from "
-                   f"the menu or because the line was closed, the rest after nobody answered.")
+        if k["voicemail_direct"] == k["voicemail"]:
+            vm_how = "all went straight there from the menu or because the line was closed"
+        elif k["voicemail_direct"] == 0:
+            vm_how = "all after nobody answered"
+        else:
+            vm_how = (f"{k['voicemail_direct']:,} went straight there from the menu or because the line was closed, "
+                      f"the rest after nobody answered")
+        obs.append(f"{k['voicemail']:,} callers ended in voicemail - {vm_how}.")
         rec.append("Make sure every voicemail box is delivered to a shared email or team inbox, with an agreed owner, "
                    "so messages are actioned the same day.")
 
@@ -1111,8 +1256,18 @@ def _write_insights(a: Analysis) -> None:
         rec.append("Enable missed-call notifications (email/app or CRM task) so nobody relies on manually "
                    "checking the call log.")
 
+    if k.get("menu_hangups"):
+        mh = k["menu_hangups"]
+        obs.append(f"{mh:,} callers ({100 * mh / max(1, k['true_missed']):.0f}% of missed calls) hung up in the phone "
+                   f"menu without reaching a ring group. The phone system records these as answered.")
+        if mh >= 3:
+            rec.append("Shorten the menu greeting and options, or add a 'press 0 / stay on the line' route to a person "
+                       f"- {mh} callers gave up in the menu.")
+
     if len(a.lines) > 1:
-        l2 = a.lines[a.lines["calls"] >= max(10, k["inbound_total"] * 0.02)]
+        l2 = a.lines[(a.lines["calls"] >= max(10, k["inbound_total"] * 0.02))
+                     & ~a.lines.index.to_series().str.contains(r"\bIVR\b|menu|Night VM|^VM\b", case=False,
+                                                               regex=True).values]
         if len(l2):
             w = l2["answer_rate"].idxmin()
             if l2.loc[w, "answer_rate"] < ar - 5:

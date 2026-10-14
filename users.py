@@ -9,12 +9,12 @@ their working pattern. Bicom gets a lighter version (answered + outbound); TruSI
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 
 import numpy as np
 import pandas as pd
 
-from cdr_engine import Analysis, Settings, ext_label, fmt_dur, in_hours
+from cdr_engine import Analysis, Settings, fmt_dur, in_hours
 
 
 @dataclass
@@ -57,7 +57,7 @@ def build_user_report(df: pd.DataFrame, a: Analysis, start: date, end: date) -> 
     u = df.attrs.get("users") if hasattr(df, "attrs") else None
     if provider == "grandstream" and u:
         return _grandstream(u, a, start, end)
-    if provider == "bicom":
+    if provider in ("bicom", "vela"):
         return _basic(a)
     return _empty("none", "This phone system's export records calls per line, not per person, so a user "
                           "assessment isn't possible from it.")
@@ -268,9 +268,12 @@ def _basic(a: Analysis) -> UserReport:
         "top": t.sort_values("answered", ascending=False).iloc[0]["name"] if total_answered else "-",
     }
     obs = {e: _user_observations(r, t, team_d, {}, hourly.get(e)) for e, r in t.iterrows()}
-    return UserReport(True, "basic", t, hourly, obs, _team_observations(t, team_d, {}, a), team_d, {},
-                      "Bicom exports show who answered and who dialled out, but not every handset that rang, so "
-                      "pick-up rate, calls lost while ringing and working hours aren't available.")
+    note = ("Vela Networks exports record which ring group answered each call (not which person) and which "
+            "extension made each outbound call, so pick-up rate, calls lost while ringing and working hours aren't "
+            "available." if a.provider == "vela" else
+            "Bicom exports show who answered and who dialled out, but not every handset that rang, so "
+            "pick-up rate, calls lost while ringing and working hours aren't available.")
+    return UserReport(True, "basic", t, hourly, obs, _team_observations(t, team_d, {}, a), team_d, {}, note)
 
 
 # --------------------------------------------------------------------------- #

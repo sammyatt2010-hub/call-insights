@@ -196,7 +196,9 @@ def chart_hourly(a: Analysis, T, w_mm, h_mm):
 def chart_reality(a: Analysis, T, w_mm, h_mm):
     k = a.kpis
     if a.caps.get("routing", True):
-        labels = ["Phone system log\n'not answered'", "Truly missed\n(after stitching)", "Never returned\n(callers)"]
+        labels = ["Phone system log\n'not answered'",
+                  "Truly missed\n(where calls ended)" if a.provider == "vela" else "Truly missed\n(after stitching)",
+                  "Never returned\n(callers)"]
         vals = [k["pbx_reported_missed"], k["true_missed"], k["unreturned_callers"]]
     else:
         labels = ["Missed calls\n(incl. engaged)", "Missed calls\nnot resolved", "Never returned\n(callers)"]
@@ -579,7 +581,7 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     _card(c, T, M, y, half, ch)
     _card(c, T, M + half + gap, y, half, ch)
     if routing:
-        yy = _section(c, T, "03", "Missed calls: log vs reality", "Before and after stitching call legs", M + pad,
+        yy = _section(c, T, "03", "Missed calls: log vs reality", ("Phone log vs where calls actually ended" if a.provider == "vela" else "Before and after stitching call legs"), M + pad,
                       y - pad)
     else:
         yy = _section(c, T, "03", "Missed calls resolved?", "Missed, unresolved and never spoken to", M + pad, y - pad)
@@ -590,7 +592,14 @@ def build_pdf(a: Analysis, customer: str = "", brand: str = "SY Communications",
     c.drawImage(chart_followup(a, T, iw / mm, chart2), M + half + gap + pad, yy - chart2 * mm, iw, chart2 * mm)
     y -= ch + 3 * mm
 
-    if routing:
+    if a.provider == "vela":
+        note = (f"<b>How to read this:</b> the phone system logs one entry per call, but records callers who hung up in "
+                f"the phone menu as 'answered'. Each of the {k['inbound_total']:,} calls has been followed to where it "
+                f"actually ended: a call only counts as answered if a person picked up, and an overflow rescue is a "
+                f"call answered after its first ring group timed out. Opening hours used: "
+                f"{s.open_time:%H:%M}-{s.close_time:%H:%M}. Callers who hung up within {s.short_abandon_s}s are "
+                f"excluded.")
+    elif routing:
         note = (f"<b>How to read this:</b> the phone system writes a separate entry for every ring group, overflow "
                 f"group, menu and voicemail a call passes through, so one caller can appear as several 'not answered' "
                 f"rows. These have been stitched back into {k['inbound_total']:,} real calls. A call only counts as "
