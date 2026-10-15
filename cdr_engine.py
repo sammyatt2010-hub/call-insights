@@ -665,6 +665,8 @@ def endpoint_kind(v: str) -> str:
         name = m.group("name").lower()
         if name.startswith("vm") or "voicemail" in name:
             return "VM"
+        if re.search(r"\bivr\b|announcement|auto ?attendant", name):
+            return "IVR"  # a recorded menu / message, not a person
         return "EXT"
     if "*" in s or s.startswith("#"):
         return "FEATURE"
@@ -742,7 +744,48 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["direction"] = df.apply(direction, axis=1)
     df["uid_sec"] = df["uid"].astype(str).str.split(".").str[0]
     df["uid_frac"] = pd.to_numeric(df["uid"].astype(str).str.split(".").str[1], errors="coerce").fillna(0)
+    _resolve_forwards(df)
     return df
+
+
+def _resolve_forwards(df: pd.DataFrame) -> None:
+    """An extension that forwards calls (e.g. 'Mobile Divert' -> a mobile) shows its inbound leg as 'Answered'
+    even when the mobile never picks up. Its outgoing leg carries the caller's number as caller ID, so match the
+    two: the inbound leg is answered only if that outgoing leg was answered with talk time. The outgoing leg is
+    part of the inbound call, not a call the business made, so it's re-labelled 'forward'."""
+    if df.empty or "clid" not in df:
+        return
+    out = df[(df["direction"] == "outbound")]
+    if out.empty:
+        return
+    def _cn(v):
+        v = str(v)
+        if "anonymous" in v.lower():
+            return "anonymous"
+        return norm_number(re.sub(r"^.*<|>.*$", "", v)) if "<" in v else ""
+
+    clid_num = out["clid"].map(_cn)
+    cand = out[clid_num != ""].assign(_cn=clid_num[clid_num != ""], _ext=lambda x: x["src"].map(ext_label))
+    if cand.empty:
+        return
+    lookup: dict = {}
+    for idx, r in cand.iterrows():
+        lookup.setdefault((r["_ext"], r["_cn"]), []).append((r["ts"], idx))
+    inb = df[(df["direction"] == "inbound") & (df["dst_kind"] == "EXT")]
+    for idx, r in inb.iterrows():
+        who = r["src_num"] or ("anonymous" if r["src_kind"] == "ANON" else "")
+        if not who:
+            continue
+        hits = [j for ts, j in lookup.get((ext_label(r["dst"]), who), [])
+                if abs((ts - r["ts"]).total_seconds()) <= 3]
+        if not hits:
+            continue
+        fw = df.loc[hits]
+        ok = fw[(fw["status"] == "Answered") & (fw["talk_s"] > 0)]
+        if r["status"] == "Answered":
+            df.at[idx, "status"] = "Answered" if len(ok) else "Not Answered"
+            df.at[idx, "talk_s"] = int(ok["talk_s"].max()) if len(ok) else 0
+        df.loc[hits, "direction"] = "forward"
 
 
 def line_labels(df: pd.DataFrame) -> dict[str, str]:
@@ -762,8 +805,15 @@ def line_labels(df: pd.DataFrame) -> dict[str, str]:
         first = g.iloc[0]
         if first["dst_kind"] == "NUM" and first["status"] == "Answered" and (g["dst_kind"] != "NUM").any():
             ivr_hits[first["dst_num"]] = ivr_hits.get(first["dst_num"], 0) + 1
+    # a menu sends callers to several different places; a line that always goes to the same place isn't one
+    second_dest: dict = {}
+    for _, g in multi.sort_values(["ts", "uid_frac"]).groupby("uid_sec"):
+        if g.iloc[0]["dst_kind"] == "NUM":
+            rest = g[g["dst_kind"] != "NUM"]
+            if len(rest):
+                second_dest.setdefault(g.iloc[0]["dst_num"], set()).add(rest.iloc[0]["dst"])
     for did, n in ivr_hits.items():
-        if n >= 5:
+        if n >= 5 and len(second_dest.get(did, ())) >= 3:
             labels[did] = "IVR / main menu"
     # Providers that name their inbound numbers (e.g. TruSIP "Chester_Sales Dummy")
     if "dst_label" in df:
@@ -788,17 +838,23 @@ def build_inbound_calls(df: pd.DataFrame) -> pd.DataFrame:
         inbound["ts"].astype("int64") // 10**9).astype("int64")
     inbound["_sec"] = sec
     inbound["_who"] = who
-    inbound = inbound.sort_values(["_who", "_sec", "ts", "uid_frac"])
-    new_call = (inbound["_who"] != inbound["_who"].shift()) | (inbound["_sec"].diff().fillna(99) > 3)
-    inbound["gkey"] = inbound["_who"] + "|" + new_call.cumsum().astype(str)
+    # groups of legs sharing a unique-id, then merge neighbouring groups from the same caller whose ids or start
+    # times are within 3s (some PBXs give the extension leg a new id a few seconds after the line leg)
+    grp = inbound.groupby(["_who", "_sec"], sort=False).agg(t0=("ts", "min")).reset_index()
+    grp = grp.sort_values(["_who", "t0", "_sec"]).reset_index(drop=True)
+    near = ((grp["_sec"].diff().abs() <= 3) | (grp["t0"].diff().dt.total_seconds().abs() <= 3))
+    new_call = (grp["_who"] != grp["_who"].shift()) | ~near.fillna(False)
+    grp["gkey"] = grp["_who"] + "|" + new_call.cumsum().astype(str)
+    inbound = inbound.merge(grp[["_who", "_sec", "gkey"]], on=["_who", "_sec"], how="left")
     inbound = inbound.sort_values(["gkey", "ts", "uid_frac"])
 
     rows = []
     for key, g in inbound.groupby("gkey", sort=False):
         legs = g.to_dict("records")
         first = legs[0]
-        non_vm = [l for l in legs if l["dst_kind"] != "VM"]
+        non_vm = [l for l in legs if l["dst_kind"] not in ("VM", "IVR")]
         vm_legs = [l for l in legs if l["dst_kind"] == "VM"]
+        ivr_legs = [l for l in legs if l["dst_kind"] == "IVR"]
 
         answer_leg = None
         for l in non_vm:
@@ -807,7 +863,7 @@ def build_inbound_calls(df: pd.DataFrame) -> pd.DataFrame:
                 break
         if answer_leg is None and non_vm:
             last = non_vm[-1]
-            later_vm = any(v["ts"] >= last["ts"] for v in vm_legs)
+            later_vm = any(v["ts"] >= last["ts"] for v in vm_legs + ivr_legs)
             if (last["dst_kind"] == "NUM" and last["status"] == "Answered"
                     and (last["talk_s"] > 0 or last["duration_s"] > 0) and not later_vm):
                 answer_leg = last
@@ -839,9 +895,13 @@ def build_inbound_calls(df: pd.DataFrame) -> pd.DataFrame:
                 outcome = "Busy"
             else:
                 outcome = "Missed"
-                if non_vm and all(re.search(r"\bivr\b", str(l["dst"]), re.I) for l in non_vm
-                                  if l["dst_kind"] != "NUM"):
-                    detail = "hung up in the menu"
+                if ivr_legs:
+                    busy_msg = any(re.search(r"busy|full|closed", str(l["dst"]), re.I) for l in ivr_legs)
+                    reached_person = any(l["dst_kind"] == "EXT" for l in non_vm)
+                    if busy_msg:
+                        detail = "got the 'all busy' message"
+                    elif not reached_person:
+                        detail = "hung up in the menu"
 
         line_leg = next((l for l in legs if l["dst_kind"] == "NUM"), first)
         rows.append({
@@ -863,14 +923,24 @@ def build_inbound_calls(df: pd.DataFrame) -> pd.DataFrame:
             "mos": np.nanmax([l["mos_v"] if l["mos_v"] and l["mos_v"] > 0 else np.nan for l in legs])
             if any(l["mos_v"] and l["mos_v"] > 0 for l in legs) else np.nan,
         })
-    calls = pd.DataFrame(rows)
+    calls = pd.DataFrame(rows, columns=INBOUND_COLS)
     if calls.empty:
-        return calls
+        return calls.astype({"ts": "datetime64[ns]", "ring_s": float, "talk_s": float, "mos": float})
     return calls.sort_values("ts").reset_index(drop=True)
+
+
+INBOUND_COLS = ["call_id", "ts", "caller", "caller_raw", "line", "line_raw", "legs", "route", "outcome", "ring_s",
+                "talk_s", "answered_by", "detail", "mos"]
 
 
 def build_outbound_calls(df: pd.DataFrame) -> pd.DataFrame:
     out = df[df["direction"] == "outbound"].copy()
+    if out.empty:
+        return pd.DataFrame({"uid": pd.Series(dtype=str), "ts": pd.Series(dtype="datetime64[ns]"),
+                             "dialled": pd.Series(dtype=str), "agent": pd.Series(dtype=str),
+                             "talk_s": pd.Series(dtype=float), "duration_s": pd.Series(dtype=float),
+                             "status": pd.Series(dtype=str), "cost": pd.Series(dtype=float),
+                             "mos": pd.Series(dtype=float), "connected": pd.Series(dtype=bool)})
     out = out.sort_values(["uid", "ts"])
     calls = out.groupby("uid", sort=False).agg(
         ts=("ts", "min"),
@@ -893,7 +963,8 @@ def track_returns(inb: pd.DataFrame, outb: pd.DataFrame, data_end: datetime, s: 
     """For every truly missed call, did we ring them back - or did they get through later?"""
     missed = inb[inb["outcome"].isin(MISSED_OUTCOMES)].copy()
     if missed.empty:
-        return missed.assign(follow_up=[], follow_up_ts=[], follow_up_by=[], minutes_to_follow_up=[])
+        return missed.assign(follow_up=pd.Series(dtype=str), follow_up_ts=pd.Series(dtype="datetime64[ns]"),
+                             follow_up_by=pd.Series(dtype=str), minutes_to_follow_up=pd.Series(dtype=float))
 
     out_by_num = {n: g.sort_values("ts") for n, g in outb.groupby("dialled")}
     answered_in = inb[inb["outcome"].isin(["Answered", "Answered via overflow"])]
@@ -924,7 +995,7 @@ def track_returns(inb: pd.DataFrame, outb: pd.DataFrame, data_end: datetime, s: 
         mins = (f_ts - r.ts).total_seconds() / 60 if pd.notna(f_ts) else np.nan
         res.append((status, f_ts, by, mins))
     missed["follow_up"] = [x[0] for x in res]
-    missed["follow_up_ts"] = [x[1] for x in res]
+    missed["follow_up_ts"] = pd.to_datetime(pd.Series([x[1] for x in res], index=missed.index), errors="coerce")
     missed["follow_up_by"] = [x[2] for x in res]
     missed["minutes_to_follow_up"] = [x[3] for x in res]
     return missed
@@ -1022,8 +1093,8 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
     outb = outb_all[(outb_all["ts"] >= lo) & (outb_all["ts"] < hi)].copy()
     missed = missed_all[(missed_all["ts"] >= lo) & (missed_all["ts"] < hi)].copy()
 
-    inb["in_hours"] = in_hours(inb["ts"], s) if len(inb) else []
-    missed["in_hours"] = in_hours(missed["ts"], s) if len(missed) else []
+    inb["in_hours"] = (in_hours(inb["ts"], s) if len(inb) else pd.Series(dtype=bool)).astype(bool)
+    missed["in_hours"] = (in_hours(missed["ts"], s) if len(missed) else pd.Series(dtype=bool)).astype(bool)
     def _line_name(n):
         if n in labels:
             return labels[n]
@@ -1134,6 +1205,16 @@ def analyse(raw_df: pd.DataFrame, start: date, end: date, s: Settings | None = N
     cb = returned_by_us.groupby("follow_up_by").size()
     team["missed_calls_returned"] = cb.reindex(team.index).fillna(0).astype(int)
 
+    # forwarding extensions (e.g. a 'Mobile Divert' to an outside phone)
+    fwd = df[df["direction"] == "forward"]
+    if len(fwd):
+        fname = fwd["src"].map(ext_label).value_counts().index[0]
+        k["forward_name"] = fname
+        k["forward_target"] = pretty_number(fwd["dst_num"].replace("", np.nan).dropna().value_counts().index[0]) \
+            if fwd["dst_num"].replace("", np.nan).notna().any() else "an outside number"
+        k["forward_answered"] = int((answered["answered_by"] == fname).sum())
+        k["forward_missed"] = int(missed["route"].str.contains(f"{re.escape(fname)}:NA", regex=True).sum()) \
+            if len(missed) else 0
     a = Analysis(start, end, inb, outb, missed, k, hourly, heat, daily, lines, team, unreturned_callers, settings=s,
                  provider=provider, caps=caps)
     _write_insights(a)
@@ -1170,9 +1251,12 @@ def _write_insights(a: Analysis) -> None:
         f"{k['inbound_total']:,} genuine inbound calls ({k['avg_inbound_per_open_day']:.0f} per working day). "
         f"During opening hours {ar:.1f}% were answered"
         f"{' - above' if ar >= s.answer_target_pct else ' - below'} the {s.answer_target_pct:.0f}% benchmark. "
-        + middle +
-        f"Of the missed calls we can judge, {k['missed_resolved_pct']:.0f}% were followed up successfully, leaving "
-        f"{k['unreturned_callers']:,} callers who never got a conversation."
+        + middle
+        + (f"Of the missed calls we can judge, {k['missed_resolved_pct']:.0f}% were followed up successfully, leaving "
+           f"{k['unreturned_callers']:,} caller{'s' if k['unreturned_callers'] != 1 else ''} who never got a "
+           f"conversation." if k["missed_judged"] else "")
+        + (f" {k['withheld_missed']:,} of the missed callers withheld their number, so they can't be called back."
+           if k["withheld_missed"] and k["withheld_missed"] >= 0.25 * max(1, k["true_missed"]) else "")
     )
 
     if hidden > 0 and routing:
@@ -1193,7 +1277,16 @@ def _write_insights(a: Analysis) -> None:
     if k["answered"] and routing and not k["answered_overflow"]:
         obs.append(f"Every answered call was picked up by the first ring group it reached, in "
                    f"{fmt_dur(k['avg_ring_s'])} on average.")
-    if k["answered"] and routing and k["answered_overflow"]:
+    if k.get("forward_answered"):
+        fa = k["forward_answered"]
+        obs.append(f"{fa:,} calls ({100 * fa / max(1, k['answered']):.0f}% of answered calls) were answered on "
+                   f"'{k['forward_name']}', which forwards to an outside phone ({k['forward_target']}).")
+        if k.get("forward_missed"):
+            obs.append(f"{k['forward_missed']:,} calls rang through to that phone but weren't answered.")
+    if k["answered"] and routing and k["answered_overflow"] and k["answered_overflow"] < 0.01 * k["answered"]:
+        obs.append(f"Only {k['answered_overflow']:,} call{'s' if k['answered_overflow'] != 1 else ''} needed the "
+                   f"overflow - average time to answer was {fmt_dur(k['avg_ring_s'])}.")
+    elif k["answered"] and routing and k["answered_overflow"]:
         ov = 100 * k["answered_overflow"] / k["answered"]
         obs.append(f"{ov:.0f}% of answered calls ({k['answered_overflow']:,}) were only picked up after the first ring "
                    f"group timed out. Average time to answer was {fmt_dur(k['avg_ring_s'])} overall versus "
@@ -1238,12 +1331,19 @@ def _write_insights(a: Analysis) -> None:
                    "so messages are actioned the same day.")
 
     if k["missed_judged"]:
-        parts = [f"{k['missed_returned_by_us']:,} were called back and connected",
-                 f"{k['missed_resolved'] - k['missed_returned_by_us']:,} customers rang again and got through"]
-        if k["attempt_only"]:
-            parts.append(f"{k['attempt_only']:,} had a call-back attempt that did not connect")
-        parts.append(f"{k['unreturned_calls'] - k['attempt_only']:,} were never returned at all")
-        obs.append("Missed-call follow-up: " + ", ".join(parts[:-1]) + " and " + parts[-1] + ".")
+        def n_(x, one, many):
+            return f"{x:,} {one if x == 1 else many}"
+        rang_again = k["missed_resolved"] - k["missed_returned_by_us"]
+        never = k["unreturned_calls"] - k["attempt_only"]
+        parts = [p for x, p in [
+            (k["missed_returned_by_us"], f"{n_(k['missed_returned_by_us'], 'was', 'were')} called back and connected"),
+            (rang_again, f"{n_(rang_again, 'customer rang', 'customers rang')} again and got through"),
+            (k["attempt_only"], f"{n_(k['attempt_only'], 'had a call-back attempt', 'had a call-back attempt')} "
+                                f"that did not connect"),
+            (never, f"{n_(never, 'was', 'were')} never returned at all")] if x]
+        if parts:
+            obs.append("Missed-call follow-up: " + (", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1
+                                                    else parts[0]) + ".")
     if not np.isnan(k["median_callback_min"]):
         obs.append(f"Typical (median) time to return a missed call was {fmt_mins(k['median_callback_min'])}; "
                    f"{k['callback_within_target_pct']:.0f}% were returned within {s.callback_target_min} minutes.")
@@ -1284,6 +1384,9 @@ def _write_insights(a: Analysis) -> None:
         rec.append("Investigate network quality for VoIP (bandwidth, QoS on the router, Wi-Fi handsets) - a "
                    "proportion of calls had poor audio scores.")
 
+    if k.get("withheld_missed", 0) >= 5 and k["withheld_missed"] >= 0.25 * max(1, k["true_missed"]):
+        rec.append(f"{k['withheld_missed']} missed callers withheld their number, so nobody can ring them back - add a "
+                   f"voicemail or 'leave your number' option when calls aren't answered.")
     if ar >= s.answer_target_pct and not rec:
         rec.append("Call handling is strong - keep monitoring monthly to protect this standard.")
     a.observations, a.recommendations = obs, rec[:7]

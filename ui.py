@@ -271,13 +271,13 @@ def render_results(df, a, p_start, p_end, settings_tuple, customer, brand, accen
                 pick = st.multiselect("Show follow-up status", opts, default=opts)
                 m = m[m["follow_up"].isin(pick)]
                 view = pd.DataFrame({
-                    "When": m["ts"].dt.strftime("%a %d %b %H:%M"),
+                    "When": pd.to_datetime(m["ts"], errors="coerce").dt.strftime("%a %d %b %H:%M"),
                     "Caller": m["caller"].map(ce.pretty_number),
                     "Line": m["line_name"],
                     "Outcome": m["outcome"] + m["detail"].map(lambda d: f" ({d})" if d else ""),
                     "In hours": m["in_hours"].map({True: "Yes", False: "No"}),
                     "Follow-up": m["follow_up"],
-                    "Followed up": m["follow_up_ts"].dt.strftime("%d %b %H:%M").fillna(""),
+                    "Followed up": pd.to_datetime(m["follow_up_ts"], errors="coerce").dt.strftime("%d %b %H:%M").fillna(""),
                     "After": m["minutes_to_follow_up"].map(ce.fmt_mins),
                     "By": m["follow_up_by"],
                     "Route through PBX": m["route"],
@@ -296,8 +296,8 @@ def render_results(df, a, p_start, p_end, settings_tuple, customer, brand, accen
                 uv = pd.DataFrame({
                     "Caller": u["caller"].map(ce.pretty_number),
                     "Missed calls": u["missed_calls"],
-                    "First missed": u["first_missed"].dt.strftime("%d %b %H:%M"),
-                    "Last missed": u["last_missed"].dt.strftime("%d %b %H:%M"),
+                    "First missed": pd.to_datetime(u["first_missed"], errors="coerce").dt.strftime("%d %b %H:%M"),
+                    "Last missed": pd.to_datetime(u["last_missed"], errors="coerce").dt.strftime("%d %b %H:%M"),
                     "Line": u["line_name"],
                     "Status": u["follow_up"],
                 })

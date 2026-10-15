@@ -69,6 +69,13 @@ Grandstream-specific clean-up:
   merged into the original call rather than counted as new inbound calls.
 - A call the UCM marks "answered" with 0 seconds of talk (the caller hung up as it was picked up) counts as missed.
 
+Bicom-specific handling:
+- Line and extension legs of the same call are joined even when their unique IDs differ by a few seconds.
+- Divert extensions (e.g. "Mobile Divert") always log "Answered"; the app checks the matching outbound
+  leg to the mobile and only counts the call as answered if that leg was actually picked up.
+- Announcement / "Busy IVR" extensions are treated as messages, not people, so a caller who only heard
+  the "all busy" message counts as missed.
+
 Vela-specific handling:
 - Internal calls are ignored; outbound calls are credited to the extension that made them (e.g. "Office 1000").
 - A call the PBX marks ANSWERED that never left the IVR (no ring group, 0s talk) is a **menu hang-up** and counts
